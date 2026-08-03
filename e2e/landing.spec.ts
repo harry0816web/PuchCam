@@ -11,3 +11,9 @@ test("prefills a shared room code from the invite URL", async ({ page }) => {
   await page.goto("/?room=BOX42");
   await expect(page.getByLabel("房間碼")).toHaveValue("BOX42");
 });
+
+test("shows the straight-punch calibration tool", async ({ page }) => {
+  await page.goto("/testing");
+  await expect(page.getByRole("heading", { name: /直拳/ })).toBeVisible();
+  await expect(page.getByRole("button", { name: "開始記錄直拳" })).toBeVisible();
+});

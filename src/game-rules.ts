@@ -3,21 +3,37 @@ export type PunchHand = "left" | "right";
 export type DodgeDirection = "向左" | "向右" | "下蹲";
 
 type Point = { x: number; y: number };
+export type MotionThresholds = { punchSpeed: number; sideDodge: number; duckDodge: number };
 
 export const GUARD_HEIGHT_RATIO = 0.32;
-export const PUNCH_SPEED_THRESHOLD = 0.0022;
+// Use two-dimensional wrist movement (X + Y), not only horizontal movement.
+// Recorded straight punches have a quiet-motion band below roughly 0.0018,
+// while real strikes peak well above it.
+export const PUNCH_SPEED_THRESHOLD = 0.0018;
+export const STRAIGHT_EXTENSION_RATIO = 1.65;
 export const SIDE_DODGE_THRESHOLD = 0.075;
 export const DUCK_DODGE_THRESHOLD = 0.105;
+
+export function createMotionThresholds(shoulderWidth?: number): MotionThresholds {
+  if (!shoulderWidth) return { punchSpeed: PUNCH_SPEED_THRESHOLD, sideDodge: SIDE_DODGE_THRESHOLD, duckDodge: DUCK_DODGE_THRESHOLD };
+  const bodyScale = Math.max(0.72, Math.min(1.4, shoulderWidth / 0.22));
+  return {
+    punchSpeed: PUNCH_SPEED_THRESHOLD * bodyScale,
+    sideDodge: Math.max(0.055, Math.min(0.115, shoulderWidth * 0.37)),
+    duckDodge: Math.max(0.085, Math.min(0.16, shoulderWidth * 0.52)),
+  };
+}
 
 export function isWristTracked(visibility?: number) {
   return (visibility ?? 1) > 0.55;
 }
 
-export function getDodgeDirection({ shoulderCenter, neutralShoulderCenter, noseX, noseY, shoulderHeight }: { shoulderCenter: number; neutralShoulderCenter: number; noseX: number; noseY: number; shoulderHeight: number }): DodgeDirection | null {
-  if (shoulderHeight - noseY < DUCK_DODGE_THRESHOLD) return "下蹲";
+export function getDodgeDirection({ shoulderCenter, neutralShoulderCenter, noseX, noseY, shoulderHeight, thresholds }: { shoulderCenter: number; neutralShoulderCenter: number; noseX: number; noseY: number; shoulderHeight: number; thresholds?: MotionThresholds }): DodgeDirection | null {
+  const { sideDodge, duckDodge } = thresholds ?? createMotionThresholds();
+  if (shoulderHeight - noseY < duckDodge) return "下蹲";
   const bodyOffset = shoulderCenter - neutralShoulderCenter;
   const headOffset = noseX - shoulderCenter;
-  if (Math.abs(bodyOffset) <= SIDE_DODGE_THRESHOLD && Math.abs(headOffset) <= SIDE_DODGE_THRESHOLD) return null;
+  if (Math.abs(bodyOffset) <= sideDodge && Math.abs(headOffset) <= sideDodge) return null;
   // The local camera preview is mirrored, so invert raw camera X for its label.
   return (Math.abs(bodyOffset) > SIDE_DODGE_THRESHOLD ? bodyOffset : headOffset) > 0 ? "向左" : "向右";
 }
@@ -26,11 +42,11 @@ export function isBlocking({ leftWrist, rightWrist, wristsTracked }: { leftWrist
   return wristsTracked && leftWrist.y < GUARD_HEIGHT_RATIO && rightWrist.y < GUARD_HEIGHT_RATIO && Math.abs(leftWrist.x - rightWrist.x) < 0.42;
 }
 
-export function getPunchKind({ speed, wrist, elbow, shoulder }: { speed: number; wrist: Point; elbow: Point; shoulder: Point }): PunchKind | null {
-  if (speed <= PUNCH_SPEED_THRESHOLD) return null;
+export function getPunchKind({ speed, wrist, elbow, shoulder, thresholds }: { speed: number; wrist: Point; elbow: Point; shoulder: Point; thresholds?: MotionThresholds }): PunchKind | null {
+  if (speed <= (thresholds?.punchSpeed ?? PUNCH_SPEED_THRESHOLD)) return null;
   const wristDistance = Math.hypot(wrist.x - shoulder.x, wrist.y - shoulder.y);
   const elbowDistance = Math.hypot(elbow.x - shoulder.x, elbow.y - shoulder.y);
-  return wristDistance > elbowDistance * 1.35 ? "straight" : "hook";
+  return wristDistance > elbowDistance * STRAIGHT_EXTENSION_RATIO ? "straight" : "hook";
 }
 
 export function damageForPunch(kind: PunchKind, isBlocking: boolean) {

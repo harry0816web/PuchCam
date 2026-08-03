@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Peer, type DataConnection, type MediaConnection } from "peerjs";
+import { damageForPunch, getDodgeDirection, getPunchKind, isBlocking, isWristTracked } from "../src/game-rules";
 
 type Fighter = "left" | "right";
 type PunchKind = "straight" | "hook";
@@ -16,8 +17,6 @@ type EventMessage =
 
 const ROUND_SECONDS = 60;
 const ROUNDS = 3;
-// In normalized camera coordinates, 0 is the top of the frame.
-const GUARD_HEIGHT_RATIO = 0.32;
 
 const TUTORIAL_STEPS = [
   { key: "straight", title: "直拳", note: "手腕快速向前伸出，手臂伸直。" },
@@ -92,8 +91,7 @@ export default function Home() {
       setEffect({ side: "right", kind: message.kind });
       window.setTimeout(() => setEffect(null), 500);
       if (!dodgeRef.current && startedRef.current) {
-        const baseDamage = message.kind === "hook" ? 14 : 10;
-        const damage = blockRef.current ? Math.ceil(baseDamage * 0.2) : baseDamage;
+        const damage = damageForPunch(message.kind, blockRef.current);
         setMyHealth((health) => Math.max(0, health - damage));
         setOpponentHits((hits) => hits + 1);
         send({ type: "hit", damage });
@@ -332,23 +330,21 @@ export default function Home() {
             const now = performance.now();
             const shoulderCenter = (points[11].x + points[12].x) / 2;
             const shoulderHeight = (points[11].y + points[12].y) / 2;
-            const leftWristVisible = (points[15].visibility ?? 1) > 0.55;
-            const rightWristVisible = (points[16].visibility ?? 1) > 0.55;
+            const leftWristVisible = isWristTracked(points[15].visibility);
+            const rightWristVisible = isWristTracked(points[16].visibility);
             const wristsInFrame = Number(leftWristVisible) + Number(rightWristVisible);
             setVisibleWrists((value) => value === wristsInFrame ? value : wristsInFrame);
             // The first stable frame becomes the seated player's neutral position.
             // This catches moving the whole upper body sideways, not only leaning the head.
             if (neutralShoulderXRef.current === null) neutralShoulderXRef.current = shoulderCenter;
-            const bodyOffset = shoulderCenter - neutralShoulderXRef.current;
-            const headOffset = points[0].x - shoulderCenter;
-            const wholeBodySideStep = Math.abs(bodyOffset) > 0.075;
-            const headLean = Math.abs(headOffset) > 0.075;
-            const ducking = shoulderHeight - points[0].y < 0.105;
-            // Dodge can be left/right movement or a duck under a hook.
-            const dodging = wholeBodySideStep || headLean || ducking;
-            // The local preview is mirrored, so invert raw camera X for the on-screen direction.
-            const dominantOffset = wholeBodySideStep ? bodyOffset : headOffset;
-            const dodgeDirection = ducking ? "下蹲" : dominantOffset > 0 ? "向左" : "向右";
+            const dodgeDirection = getDodgeDirection({
+              shoulderCenter,
+              neutralShoulderCenter: neutralShoulderXRef.current,
+              noseX: points[0].x,
+              noseY: points[0].y,
+              shoulderHeight,
+            });
+            const dodging = dodgeDirection !== null;
             // Slowly re-centre only while neutral, so a deliberate dodge isn't absorbed as a new baseline.
             if (!dodging) neutralShoulderXRef.current = neutralShoulderXRef.current * 0.97 + shoulderCenter * 0.03;
             if (dodging !== dodgeRef.current) {
@@ -359,10 +355,11 @@ export default function Home() {
             // Guard requires both wrists to be raised into the top 32% of the
             // camera frame, so a relaxed hands-up pose is not treated as a block.
             // Dodge has priority over guard: crouching with raised hands is still a duck.
-            const blocking = !dodging && leftWristVisible && rightWristVisible
-              && points[15].y < GUARD_HEIGHT_RATIO
-              && points[16].y < GUARD_HEIGHT_RATIO
-              && Math.abs(points[15].x - points[16].x) < 0.42;
+            const blocking = !dodging && isBlocking({
+              leftWrist: points[15],
+              rightWrist: points[16],
+              wristsTracked: leftWristVisible && rightWristVisible,
+            });
             if (blocking !== blockRef.current) {
               blockRef.current = blocking;
               send({ type: "block", active: blocking });
@@ -371,11 +368,11 @@ export default function Home() {
             ([{ key: "left", wrist: points[15], elbow: points[13], shoulder: points[11], visible: leftWristVisible }, { key: "right", wrist: points[16], elbow: points[14], shoulder: points[12], visible: rightWristVisible }] as const).forEach(({ key, wrist, elbow, shoulder, visible }) => {
               const previous = lastWristRef.current[key];
               const speed = previous ? Math.abs(wrist.x - previous) / Math.max(1, now - lastWristRef.current.at) : 0;
-              const extension = Math.hypot(wrist.x - shoulder.x, wrist.y - shoulder.y) > Math.hypot(elbow.x - shoulder.x, elbow.y - shoulder.y) * 1.35;
+              const punchKind = getPunchKind({ speed, wrist, elbow, shoulder });
               // A hand must be confidently visible to attack. When neither wrist is
               // visible, only the head-and-shoulder dodge rule remains active.
-              if (visible && !dodging && !blocking && now > cooldownRef.current[key] && speed > 0.0022) {
-                announcePunch(extension ? "straight" : "hook");
+              if (visible && !dodging && !blocking && now > cooldownRef.current[key] && punchKind) {
+                announcePunch(punchKind);
                 cooldownRef.current[key] = now + 650;
               }
               // Prevent the end of a dodge from immediately becoming a hook.

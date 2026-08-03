@@ -1,4 +1,5 @@
 export type PunchKind = "straight" | "hook";
+export type PunchHand = "left" | "right";
 export type DodgeDirection = "向左" | "向右" | "下蹲";
 
 type Point = { x: number; y: number };
@@ -35,4 +36,14 @@ export function getPunchKind({ speed, wrist, elbow, shoulder }: { speed: number;
 export function damageForPunch(kind: PunchKind, isBlocking: boolean) {
   const baseDamage = kind === "hook" ? 14 : 10;
   return isBlocking ? Math.ceil(baseDamage * 0.2) : baseDamage;
+}
+
+export function isDodgeEffective(kind: PunchKind, dodge: DodgeDirection | null) {
+  return (kind === "straight" && (dodge === "向左" || dodge === "向右")) || (kind === "hook" && dodge === "下蹲");
+}
+
+export function resolvePunch(kind: PunchKind, dodge: DodgeDirection | null, isBlocking: boolean) {
+  if (isDodgeEffective(kind, dodge)) return { damage: 0, outcome: "evaded" as const };
+  if (isBlocking) return { damage: damageForPunch(kind, true), outcome: "blocked" as const };
+  return { damage: damageForPunch(kind, false), outcome: "hit" as const };
 }

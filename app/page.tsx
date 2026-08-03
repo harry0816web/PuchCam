@@ -2,15 +2,15 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Peer, type DataConnection, type MediaConnection } from "peerjs";
-import { damageForPunch, getDodgeDirection, getPunchKind, isBlocking, isWristTracked } from "../src/game-rules";
+import { getDodgeDirection, getPunchKind, isBlocking, isWristTracked, resolvePunch, type DodgeDirection, type PunchHand } from "../src/game-rules";
 
 type Fighter = "left" | "right";
 type PunchKind = "straight" | "hook";
 type MaskKind = "frog" | "pig" | "rabbit";
 type FacePose = { x: number; y: number; scale: number; pitch: number; yaw: number; roll: number };
 type EventMessage =
-  | { type: "punch"; kind: PunchKind }
-  | { type: "dodge"; active: boolean }
+  | { type: "punch"; kind: PunchKind; hand: PunchHand }
+  | { type: "dodge"; active: boolean; direction?: DodgeDirection }
   | { type: "block"; active: boolean }
   | { type: "tutorialReady" }
   | { type: "ready" }
@@ -47,6 +47,7 @@ export default function Home() {
   const neutralShoulderXRef = useRef<number | null>(null);
   const cooldownRef = useRef({ left: 0, right: 0 });
   const dodgeRef = useRef(false);
+  const dodgeDirectionRef = useRef<DodgeDirection | null>(null);
   const blockRef = useRef(false);
   const startedRef = useRef(false);
   const tutorialReadyRef = useRef(false);
@@ -98,14 +99,20 @@ export default function Home() {
     if (message.type === "punch") {
       setEffect({ side: "right", kind: message.kind });
       window.setTimeout(() => setEffect(null), 500);
-      if (!dodgeRef.current && startedRef.current) {
-        const damage = damageForPunch(message.kind, blockRef.current);
+      if (startedRef.current) {
+        const result = resolvePunch(message.kind, dodgeDirectionRef.current, blockRef.current);
+        if (result.outcome === "evaded") {
+          setStatus(message.kind === "straight" ? "漂亮側閃，躲過直拳！" : "下蹲成功，躲過勾拳！");
+          return;
+        }
+        const damage = result.damage;
         setMyHealth((health) => Math.max(0, health - damage));
         setOpponentHits((hits) => hits + 1);
         send({ type: "hit", damage });
+        if (result.outcome === "blocked") setStatus("格檔成功，傷害降低！");
       }
     }
-    if (message.type === "dodge") setStatus(message.active ? "對手正在閃躲！" : "對手就位");
+    if (message.type === "dodge") setStatus(message.active ? `對手正在${message.direction ?? ""}閃躲！` : "對手就位");
     if (message.type === "block") setStatus(message.active ? "對手正在格檔！" : "對手解除格檔");
     if (message.type === "hit") {
       setOpponentHealth((health) => Math.max(0, health - message.damage));
@@ -240,11 +247,11 @@ export default function Home() {
     if (isHost && opponentTutorialReadyRef.current) scheduleMatchStart();
   };
 
-  const announcePunch = useCallback((kind: PunchKind) => {
+  const announcePunch = useCallback((kind: PunchKind, hand: PunchHand) => {
     setEffect({ side: "left", kind });
-    setLastMove(kind === "straight" ? "偵測到直拳！" : "偵測到勾拳！");
+    setLastMove(`偵測到${hand === "left" ? "左" : "右"}${kind === "straight" ? "直拳" : "勾拳"}！`);
     // Preview effects work before the match starts; damage is only shared in a live round.
-    if (startedRef.current) send({ type: "punch", kind });
+    if (startedRef.current) send({ type: "punch", kind, hand });
     window.setTimeout(() => setEffect(null), 500);
   }, [send]);
 
@@ -477,11 +484,13 @@ export default function Home() {
             const dodging = dodgeDirection !== null;
             // Slowly re-centre only while neutral, so a deliberate dodge isn't absorbed as a new baseline.
             if (!dodging) neutralShoulderXRef.current = neutralShoulderXRef.current * 0.97 + shoulderCenter * 0.03;
+            if (dodging) dodgeDirectionRef.current = dodgeDirection;
             if (dodging !== dodgeRef.current) {
               dodgeRef.current = dodging;
-              send({ type: "dodge", active: dodging });
+              send({ type: "dodge", active: dodging, direction: dodgeDirection ?? undefined });
               if (dodging) setLastMove(`偵測到${dodgeDirection}閃躲！`);
             }
+            if (!dodging) dodgeDirectionRef.current = null;
             // Guard requires both wrists to be raised into the top 32% of the
             // camera frame, so a relaxed hands-up pose is not treated as a block.
             // Dodge has priority over guard: crouching with raised hands is still a duck.
@@ -502,7 +511,7 @@ export default function Home() {
               // A hand must be confidently visible to attack. When neither wrist is
               // visible, only the head-and-shoulder dodge rule remains active.
               if (visible && !dodging && !blocking && now > cooldownRef.current[key] && punchKind) {
-                announcePunch(punchKind);
+                announcePunch(punchKind, key);
                 cooldownRef.current[key] = now + 650;
               }
               // Prevent the end of a dodge from immediately becoming a hook.

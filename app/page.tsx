@@ -47,6 +47,7 @@ export default function Home() {
   const tutorialReadyRef = useRef(false);
   const opponentTutorialReadyRef = useRef(false);
   const countdownRef = useRef(false);
+  const retryTimerRef = useRef<number | null>(null);
 
   const [roomCode, setRoomCode] = useState("");
   const [roomInput, setRoomInput] = useState("");
@@ -68,6 +69,7 @@ export default function Home() {
   const [visibleWrists, setVisibleWrists] = useState(0);
   const [tutorialStep, setTutorialStep] = useState(0);
   const [tutorialComplete, setTutorialComplete] = useState(false);
+  const [hostPeerReady, setHostPeerReady] = useState(false);
 
   const roomLink = typeof window === "undefined" || !roomCode ? "" : `${window.location.origin}${window.location.pathname}?room=${roomCode}`;
 
@@ -114,16 +116,23 @@ export default function Home() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isHost, send]);
 
-  const attachConnection = useCallback((connection: DataConnection) => {
+  const attachConnection = useCallback((connection: DataConnection, callbacks?: { onOpen?: () => void; onFailure?: () => void }) => {
+    let opened = false;
     connectionRef.current = connection;
     connection.on("open", () => {
+      opened = true;
       setConnected(true);
       setStatus("朋友已進入房間，請完成動作教學");
+      callbacks?.onOpen?.();
     });
     connection.on("data", receive);
+    connection.on("error", () => {
+      if (!opened) callbacks?.onFailure?.();
+    });
     connection.on("close", () => {
       setConnected(false);
-      setStatus("朋友離開了房間");
+      if (!opened) callbacks?.onFailure?.();
+      else setStatus("朋友離開了房間");
     });
   }, [receive, send]);
 
@@ -151,22 +160,53 @@ export default function Home() {
     const peer = id ? new Peer(id) : new Peer();
     peerRef.current = peer;
     peer.on("open", () => {
-      if (!host) {
-        const hostId = `punch-arena-${code.toLowerCase()}`;
-        attachConnection(peer.connect(hostId, { reliable: true }));
-        if (streamRef.current) attachCall(peer.call(hostId, streamRef.current));
-        setStatus("正在連上朋友的擂台…");
+      if (host) {
+        setHostPeerReady(true);
+        setStatus("房間已準備完成，現在可以分享邀請連結。");
+        return;
       }
+      const hostId = `punch-arena-${code.toLowerCase()}`;
+      let attempts = 0;
+      const retry = () => {
+        if (retryTimerRef.current !== null || connectionRef.current?.open) return;
+        attempts += 1;
+        const delay = Math.min(1000 + attempts * 300, 3000);
+        setStatus(`尚未連上房主，${Math.ceil(delay / 1000)} 秒後自動重試…`);
+        retryTimerRef.current = window.setTimeout(() => {
+          retryTimerRef.current = null;
+          connect();
+        }, delay);
+      };
+      const connect = () => {
+        if (connectionRef.current?.open) return;
+        setStatus(`正在連上朋友的擂台…（第 ${attempts + 1} 次）`);
+        const connection = peer.connect(hostId, { reliable: true });
+        attachConnection(connection, {
+          onOpen: () => {
+            if (retryTimerRef.current !== null) window.clearTimeout(retryTimerRef.current);
+            retryTimerRef.current = null;
+            if (streamRef.current) attachCall(peer.call(hostId, streamRef.current));
+          },
+          onFailure: retry,
+        });
+      };
+      connect();
     });
     peer.on("connection", attachConnection);
     peer.on("call", attachCall);
-    peer.on("error", () => setStatus(host ? "此房間碼已有人使用，請建立另一個房間。" : "尚未找到房主，請確認朋友已先開啟邀請連結。"));
+    peer.on("error", (error) => {
+      if (host) {
+        setHostPeerReady(false);
+        setStatus(error.type === "unavailable-id" ? "此房間碼已有人使用，請建立另一個房間。" : "房間建立失敗，請重新建立房間。");
+      }
+    });
   }, [attachCall, attachConnection]);
 
   const createRoom = async () => {
     const code = makeRoomCode();
     setRoomCode(code);
     setIsHost(true);
+    setHostPeerReady(false);
     await activateCamera();
     joinPeer(code, true);
   };
@@ -359,6 +399,7 @@ export default function Home() {
   }, [cameraReady, announcePunch, send, drawPose]);
 
   useEffect(() => () => {
+    if (retryTimerRef.current !== null) window.clearTimeout(retryTimerRef.current);
     peerRef.current?.destroy();
     streamRef.current?.getTracks().forEach((track) => track.stop());
   }, []);
@@ -398,7 +439,7 @@ export default function Home() {
             <article className="fighter you"><video ref={videoRef} autoPlay muted playsInline /><canvas ref={poseCanvasRef} className="pose-overlay" /><span className={`tracking ${tracking ? "active" : ""}`}>{tracking ? "● 上半身追蹤中" : "○ 找不到上半身"}</span><span className="tag">YOU</span>{effect?.side === "left" && <div className={`impact ${effect.kind}`}>POW!</div>}</article>
             <article className="fighter friend"><video ref={opponentVideoRef} autoPlay playsInline /><span className="tag">FRIEND</span>{effect?.side === "right" && <div className={`impact ${effect.kind}`}>BAM!</div>} {!connected && <div className="waiting">等待對手<br /><small>分享下方連結</small></div>}</article>
           </section>
-          <section className="room-card"><div><label>ROOM CODE</label><b>{roomCode}</b></div>{isHost && <button className="copy" onClick={() => navigator.clipboard.writeText(roomLink)}>複製邀請連結</button>}<p>{gameMessage || status} <span className="move-readout">{visibleWrists === 0 ? "手腕未入鏡：僅可閃躲" : lastMove}</span></p></section>
+          <section className="room-card"><div><label>ROOM CODE</label><b>{roomCode}</b></div>{isHost && <button className="copy" disabled={!hostPeerReady} onClick={() => navigator.clipboard.writeText(roomLink)}>{hostPeerReady ? "複製邀請連結" : "正在建立房間…"}</button>}<p>{gameMessage || status} <span className="move-readout">{visibleWrists === 0 ? "手腕未入鏡：僅可閃躲" : lastMove}</span></p></section>
         </>}
         <footer>坐著即可玩：肩膀、雙手與頭部保持入鏡 · 對手側身即可閃躲</footer>
       </section>

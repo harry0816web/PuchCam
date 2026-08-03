@@ -148,7 +148,7 @@ export default function Home() {
 
   const joinPeer = useCallback((code: string, host: boolean) => {
     const id = host ? `punch-arena-${code.toLowerCase()}` : undefined;
-    const peer = new Peer(id);
+    const peer = id ? new Peer(id) : new Peer();
     peerRef.current = peer;
     peer.on("open", () => {
       if (!host) {

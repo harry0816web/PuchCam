@@ -10,6 +10,8 @@ type MaskKind = "frog" | "pig" | "rabbit";
 type FacePose = { x: number; y: number; scale: number; pitch: number; yaw: number; roll: number };
 type FaceExpression = { leftBlink: number; rightBlink: number; mouthOpen: number; smile: number };
 type HandPosition = { x: number; y: number };
+type HitEffect = "hit" | "block";
+type TutorialPhase = "explain" | "practice";
 type EventMessage =
   | { type: "punch"; kind: PunchKind; hand: PunchHand }
   | { type: "dodge"; active: boolean; direction?: DodgeDirection }
@@ -59,8 +61,13 @@ export default function Home() {
   const startedRef = useRef(false);
   const tutorialReadyRef = useRef(false);
   const opponentTutorialReadyRef = useRef(false);
+  const tutorialStepRef = useRef(0);
+  const tutorialPhaseRef = useRef<TutorialPhase>("explain");
+  const tutorialPracticeCountRef = useRef(0);
+  const tutorialAdvanceTimerRef = useRef<number | null>(null);
   const countdownRef = useRef(false);
   const retryTimerRef = useRef<number | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
 
   const [roomCode, setRoomCode] = useState("");
   const [roomInput, setRoomInput] = useState("");
@@ -75,12 +82,15 @@ export default function Home() {
   const [myHits, setMyHits] = useState(0);
   const [opponentHits, setOpponentHits] = useState(0);
   const [effect, setEffect] = useState<{ side: Fighter; kind: PunchKind } | null>(null);
+  const [hitEffect, setHitEffect] = useState<HitEffect | null>(null);
   const [gameMessage, setGameMessage] = useState("");
   const [started, setStarted] = useState(false);
   const [tracking, setTracking] = useState(false);
   const [lastMove, setLastMove] = useState("等待揮拳");
   const [visibleWrists, setVisibleWrists] = useState(0);
   const [tutorialStep, setTutorialStep] = useState(0);
+  const [tutorialPhase, setTutorialPhase] = useState<TutorialPhase>("explain");
+  const [tutorialPracticeCount, setTutorialPracticeCount] = useState(0);
   const [tutorialComplete, setTutorialComplete] = useState(false);
   const [hostPeerReady, setHostPeerReady] = useState(false);
   const [mask, setMask] = useState<MaskKind>("frog");
@@ -92,6 +102,33 @@ export default function Home() {
   const send = useCallback((message: EventMessage) => {
     if (connectionRef.current?.open) connectionRef.current.send(message);
   }, []);
+
+  const playImpactSound = useCallback((blocked: boolean) => {
+    const AudioContextClass = window.AudioContext ?? (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!AudioContextClass) return;
+    const context = audioContextRef.current ?? new AudioContextClass();
+    audioContextRef.current = context;
+    if (context.state === "suspended") void context.resume();
+
+    const now = context.currentTime;
+    const oscillator = context.createOscillator();
+    const gain = context.createGain();
+    oscillator.type = blocked ? "triangle" : "square";
+    oscillator.frequency.setValueAtTime(blocked ? 260 : 170, now);
+    oscillator.frequency.exponentialRampToValueAtTime(blocked ? 120 : 58, now + 0.13);
+    gain.gain.setValueAtTime(0.0001, now);
+    gain.gain.exponentialRampToValueAtTime(blocked ? 0.07 : 0.12, now + 0.008);
+    gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.16);
+    oscillator.connect(gain).connect(context.destination);
+    oscillator.start(now);
+    oscillator.stop(now + 0.17);
+  }, []);
+
+  const showHitEffect = useCallback((blocked: boolean) => {
+    setHitEffect(blocked ? "block" : "hit");
+    playImpactSound(blocked);
+    window.setTimeout(() => setHitEffect(null), 450);
+  }, [playImpactSound]);
 
   function scheduleMatchStart() {
     if (countdownRef.current || startedRef.current) return;
@@ -117,7 +154,9 @@ export default function Home() {
         setMyHealth((health) => Math.max(0, health - damage));
         setOpponentHits((hits) => hits + 1);
         send({ type: "hit", damage });
-        if (result.outcome === "blocked") setStatus("格檔成功，傷害降低！");
+        const blocked = result.outcome === "blocked";
+        showHitEffect(blocked);
+        if (blocked) setStatus("格檔成功，傷害降低！");
       }
     }
     if (message.type === "dodge") setStatus(message.active ? `對手正在${message.direction ?? ""}閃躲！` : "對手就位");
@@ -136,7 +175,7 @@ export default function Home() {
       window.setTimeout(() => startMatch(), Math.max(0, message.startsAt - Date.now()));
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isHost, send]);
+  }, [isHost, send, showHitEffect]);
 
   const attachConnection = useCallback((connection: DataConnection, callbacks?: { onOpen?: () => void; onFailure?: () => void }) => {
     let opened = false;
@@ -287,13 +326,53 @@ export default function Home() {
     if (isHost && opponentTutorialReadyRef.current) scheduleMatchStart();
   };
 
+  const startTutorialPractice = () => {
+    tutorialPracticeCountRef.current = 0;
+    tutorialPhaseRef.current = "practice";
+    setTutorialPracticeCount(0);
+    setTutorialPhase("practice");
+    setStatus(`練習${TUTORIAL_STEPS[tutorialStepRef.current].title}：成功做出兩次即可過關。`);
+  };
+
+  const registerTutorialMove = useCallback((key: typeof TUTORIAL_STEPS[number]["key"]) => {
+    const step = tutorialStepRef.current;
+    if (tutorialComplete || startedRef.current || tutorialPhaseRef.current !== "practice" || TUTORIAL_STEPS[step].key !== key) return;
+    const nextCount = tutorialPracticeCountRef.current + 1;
+    tutorialPracticeCountRef.current = nextCount;
+    setTutorialPracticeCount(nextCount);
+    if (nextCount < 2) {
+      setStatus(`成功 1 / 2，再做一次${TUTORIAL_STEPS[step].title}！`);
+      return;
+    }
+
+    tutorialPhaseRef.current = "explain";
+    setTutorialPhase("explain");
+    setStatus(`${TUTORIAL_STEPS[step].title}完成！`);
+    tutorialAdvanceTimerRef.current = window.setTimeout(() => {
+      if (tutorialStepRef.current !== step || tutorialPracticeCountRef.current !== nextCount) return;
+      if (step === TUTORIAL_STEPS.length - 1) {
+        tutorialReadyRef.current = true;
+        setTutorialComplete(true);
+        send({ type: "tutorialReady" });
+        setStatus("你已完成教學，等待朋友。 ");
+        if (isHost && opponentTutorialReadyRef.current) scheduleMatchStart();
+        return;
+      }
+      tutorialStepRef.current = step + 1;
+      tutorialPracticeCountRef.current = 0;
+      setTutorialStep(step + 1);
+      setTutorialPracticeCount(0);
+    }, 650);
+  }, [isHost, send, tutorialComplete]);
+
   const announcePunch = useCallback((kind: PunchKind, hand: PunchHand) => {
     setEffect({ side: "left", kind });
     setLastMove(`偵測到${hand === "left" ? "左" : "右"}${kind === "straight" ? "直拳" : "勾拳"}！`);
+    registerTutorialMove(kind);
     // Preview effects work before the match starts; damage is only shared in a live round.
     if (startedRef.current) send({ type: "punch", kind, hand });
     window.setTimeout(() => setEffect(null), 500);
-  }, [send]);
+  }, [send, registerTutorialMove]);
 
   const drawPose = useCallback((points: Array<{ x: number; y: number; visibility?: number }>) => {
     const canvas = poseCanvasRef.current;
@@ -581,7 +660,10 @@ export default function Home() {
             if (dodging !== dodgeRef.current) {
               dodgeRef.current = dodging;
               send({ type: "dodge", active: dodging, direction: dodgeDirection ?? undefined });
-              if (dodging) setLastMove(`偵測到${dodgeDirection}閃躲！`);
+              if (dodging) {
+                setLastMove(`偵測到${dodgeDirection}閃躲！`);
+                registerTutorialMove(dodgeDirection === "下蹲" ? "duck" : "side");
+              }
             }
             if (!dodging) dodgeDirectionRef.current = null;
             // Guard requires both wrists to be raised into the top 32% of the
@@ -595,7 +677,10 @@ export default function Home() {
             if (blocking !== blockRef.current) {
               blockRef.current = blocking;
               send({ type: "block", active: blocking });
-              if (blocking) setLastMove("偵測到格檔！受到傷害降低 80%");
+              if (blocking) {
+                setLastMove("偵測到格檔！受到傷害降低 80%");
+                registerTutorialMove("block");
+              }
             }
             ([{ key: "left", wrist: points[15], elbow: points[13], shoulder: points[11], visible: leftWristVisible }, { key: "right", wrist: points[16], elbow: points[14], shoulder: points[12], visible: rightWristVisible }] as const).forEach(({ key, wrist, elbow, shoulder, visible }) => {
               const previous = lastWristRef.current[key];
@@ -628,14 +713,16 @@ export default function Home() {
     };
     if (cameraReady) runDetection().catch(() => setStatus("動作辨識載入失敗，但視訊連線仍可使用。"));
     return () => { cancelled = true; if (animationRef.current) cancelAnimationFrame(animationRef.current); };
-  }, [cameraReady, announcePunch, send, drawPose]);
+  }, [cameraReady, announcePunch, send, drawPose, registerTutorialMove]);
 
   useEffect(() => () => {
     if (retryTimerRef.current !== null) window.clearTimeout(retryTimerRef.current);
+    if (tutorialAdvanceTimerRef.current !== null) window.clearTimeout(tutorialAdvanceTimerRef.current);
     if (compositeFrameRef.current !== null) cancelAnimationFrame(compositeFrameRef.current);
     peerRef.current?.destroy();
     outboundStreamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current?.getTracks().forEach((track) => track.stop());
+    void audioContextRef.current?.close();
   }, []);
 
   const lesson = TUTORIAL_STEPS[tutorialStep];
@@ -652,8 +739,8 @@ export default function Home() {
         {roomCode && connected && !started && !tutorialComplete && <section className="tutorial-overlay" aria-label="動作教學">
           <div className="tutorial-top"><span>動作教學 {tutorialStep + 1} / {TUTORIAL_STEPS.length}</span><div className="tutorial-progress"><i style={{ width: `${((tutorialStep + 1) / TUTORIAL_STEPS.length) * 100}%` }} /></div></div>
           <div className={`coach-canvas ${lesson.key}`} aria-hidden="true"><div className="coach-head" /><div className="coach-body" /><i className="coach-arm left" /><i className="coach-arm right" /><i className="coach-leg left" /><i className="coach-leg right" /><b className="coach-effect">{lesson.key === "block" ? "GUARD" : lesson.key === "duck" ? "DUCK" : lesson.key === "side" ? "SWAY" : "POW!"}</b></div>
-          <div className="tutorial-copy"><p>MOVE {String(tutorialStep + 1).padStart(2, "0")}</p><h2>{lesson.title}</h2><span>{lesson.note}</span></div>
-          <div className="tutorial-actions">{tutorialStep > 0 && <button className="tutorial-back" onClick={() => setTutorialStep((step) => step - 1)}>上一個</button>}{tutorialStep < TUTORIAL_STEPS.length - 1 ? <button className="tutorial-next" onClick={() => setTutorialStep((step) => step + 1)}>下一個動作 →</button> : <button className="tutorial-next" onClick={finishTutorial}>準備開打 →</button>}</div>
+          <div className="tutorial-copy"><p>MOVE {String(tutorialStep + 1).padStart(2, "0")}</p><h2>{lesson.title}</h2><span>{tutorialPhase === "explain" ? lesson.note : `現在請成功做出這個動作兩次。`}</span>{tutorialPhase === "practice" && <strong className="tutorial-count" aria-live="polite">成功 {tutorialPracticeCount} / 2</strong>}</div>
+          <div className="tutorial-actions">{tutorialPhase === "explain" && <button className="tutorial-next" onClick={startTutorialPractice}>開始練習 →</button>}<button className="tutorial-skip" onClick={finishTutorial}>跳過全部教學</button></div>
         </section>}
 
         {!roomCode ? <section className="lobby">
@@ -670,7 +757,7 @@ export default function Home() {
             <div className="opponent"><label>FRIEND</label><strong>{opponentHealth}</strong><div className="health"><i style={{ width: `${opponentHealth}%` }} /></div><small>{opponentHits} HITS</small></div>
           </section>
           <section className="video-grid">
-            <article className="fighter you"><video ref={videoRef} autoPlay muted playsInline /><canvas ref={poseCanvasRef} className="pose-overlay" /><canvas ref={faceCanvasRef} className="three-mask-overlay" /><div className="mask-picker" aria-label="選擇 3D 頭套">{([{ key: "frog", emoji: "🐸" }, { key: "pig", emoji: "🐷" }, { key: "rabbit", emoji: "🐰" }] as const).map(({ key, emoji }) => <button key={key} className={mask === key ? "selected" : ""} onClick={() => setMask(key)} aria-label={`選擇 ${emoji} 3D 頭套`}>{emoji}</button>)}</div><span className={`face-tracking ${faceTracked ? "active" : ""}`}>{faceTracked ? "● 3D FACE" : "○ 找不到臉部"}</span><span className={`tracking ${tracking ? "active" : ""}`}>{tracking ? "● 上半身追蹤中" : "○ 找不到上半身"}</span><span className="tag">YOU</span>{effect?.side === "left" && <div className={`attack-fx ${effect.kind}`}><i /><i /><i /><b>{effect.kind === "straight" ? "KAPOW!" : "WHAM!"}</b></div>}</article>
+            <article className="fighter you"><video ref={videoRef} autoPlay muted playsInline /><canvas ref={poseCanvasRef} className="pose-overlay" /><canvas ref={faceCanvasRef} className="three-mask-overlay" /><div className="mask-picker" aria-label="選擇 3D 頭套">{([{ key: "frog", emoji: "🐸" }, { key: "pig", emoji: "🐷" }, { key: "rabbit", emoji: "🐰" }] as const).map(({ key, emoji }) => <button key={key} className={mask === key ? "selected" : ""} onClick={() => setMask(key)} aria-label={`選擇 ${emoji} 3D 頭套`}>{emoji}</button>)}</div><span className={`face-tracking ${faceTracked ? "active" : ""}`}>{faceTracked ? "● 3D FACE" : "○ 找不到臉部"}</span><span className={`tracking ${tracking ? "active" : ""}`}>{tracking ? "● 上半身追蹤中" : "○ 找不到上半身"}</span><span className="tag">YOU</span>{effect?.side === "left" && <div className={`attack-fx ${effect.kind}`}><i /><i /><i /><b>{effect.kind === "straight" ? "KAPOW!" : "WHAM!"}</b></div>}{hitEffect && <div className={`damage-fx ${hitEffect}`} aria-live="polite"><i /><i /><b>{hitEffect === "block" ? "BLOCK!" : "HIT!"}</b></div>}</article>
             <article className="fighter friend"><video ref={opponentVideoRef} autoPlay playsInline />{opponentHands.left && <span className="opponent-glove left" style={{ left: `${opponentHands.left.x * 100}%`, top: `${opponentHands.left.y * 100}%` }}>🥊</span>}{opponentHands.right && <span className="opponent-glove right" style={{ left: `${opponentHands.right.x * 100}%`, top: `${opponentHands.right.y * 100}%` }}>🥊</span>}<span className="tag">FRIEND</span>{effect?.side === "right" && <div className={`attack-fx ${effect.kind}`}><i /><i /><i /><b>{effect.kind === "straight" ? "KAPOW!" : "WHAM!"}</b></div>} {!connected && <div className="waiting">等待對手<br /><small>分享下方連結</small></div>}</article>
           </section>
           <section className="room-card"><div><label>ROOM CODE</label><b>{roomCode}</b></div>{isHost && <button className="copy" disabled={!hostPeerReady} onClick={() => navigator.clipboard.writeText(roomLink)}>{hostPeerReady ? "複製邀請連結" : "正在建立房間…"}</button>}<p>{gameMessage || status} <span className="move-readout">{visibleWrists === 0 ? "手腕未入鏡：僅可閃躲" : lastMove}</span></p></section>

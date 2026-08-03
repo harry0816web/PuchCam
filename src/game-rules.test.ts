@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { damageForPunch, getDodgeDirection, getPunchKind, isBlocking, isWristTracked } from "./game-rules";
+import { damageForPunch, getDodgeDirection, getPunchKind, isBlocking, isDodgeEffective, isWristTracked, resolvePunch } from "./game-rules";
 
 describe("game movement rules", () => {
   it("only considers confidently visible wrists as tracked", () => {
@@ -24,5 +24,14 @@ describe("game movement rules", () => {
     expect(isBlocking({ leftWrist: { x: 0.42, y: 0.4 }, rightWrist: { x: 0.58, y: 0.2 }, wristsTracked: true })).toBe(false);
     expect(damageForPunch("hook", true)).toBe(3);
     expect(damageForPunch("straight", false)).toBe(10);
+  });
+
+  it("uses the intended attack-and-defence matchups", () => {
+    expect(isDodgeEffective("straight", "向左")).toBe(true);
+    expect(isDodgeEffective("straight", "下蹲")).toBe(false);
+    expect(isDodgeEffective("hook", "下蹲")).toBe(true);
+    expect(isDodgeEffective("hook", "向右")).toBe(false);
+    expect(resolvePunch("straight", "向右", false)).toEqual({ damage: 0, outcome: "evaded" });
+    expect(resolvePunch("hook", null, true)).toEqual({ damage: 3, outcome: "blocked" });
   });
 });

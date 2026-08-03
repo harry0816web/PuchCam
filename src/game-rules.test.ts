@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { damageForPunch, getDodgeDirection, getPunchKind, isBlocking, isDodgeEffective, isWristTracked, resolvePunch } from "./game-rules";
+import { createMotionThresholds, damageForPunch, getDodgeDirection, getPunchKind, isBlocking, isDodgeEffective, isWristTracked, resolvePunch } from "./game-rules";
 
 describe("game movement rules", () => {
   it("only considers confidently visible wrists as tracked", () => {
@@ -10,7 +10,13 @@ describe("game movement rules", () => {
   it("classifies straight punches, hooks, and motion below the threshold", () => {
     expect(getPunchKind({ speed: 0.003, shoulder: { x: 0.5, y: 0.5 }, elbow: { x: 0.6, y: 0.5 }, wrist: { x: 0.75, y: 0.5 } })).toBe("straight");
     expect(getPunchKind({ speed: 0.003, shoulder: { x: 0.5, y: 0.5 }, elbow: { x: 0.7, y: 0.5 }, wrist: { x: 0.62, y: 0.65 } })).toBe("hook");
-    expect(getPunchKind({ speed: 0.0022, shoulder: { x: 0.5, y: 0.5 }, elbow: { x: 0.6, y: 0.5 }, wrist: { x: 0.75, y: 0.5 } })).toBeNull();
+    expect(getPunchKind({ speed: 0.0018, shoulder: { x: 0.5, y: 0.5 }, elbow: { x: 0.6, y: 0.5 }, wrist: { x: 0.75, y: 0.5 } })).toBeNull();
+  });
+
+  it("recognizes the recorded right-hand straight-punch shape", () => {
+    // Real sample from the calibration tool: t=2089 ms in the supplied
+    // right-hand straight-punch recording.
+    expect(getPunchKind({ speed: 0.0085, shoulder: { x: 0.4133, y: 0.7212 }, elbow: { x: 0.3013, y: 0.7388 }, wrist: { x: 0.3979, y: 0.348 } })).toBe("straight");
   });
 
   it("detects side steps and ducks", () => {
@@ -33,5 +39,13 @@ describe("game movement rules", () => {
     expect(isDodgeEffective("hook", "向右")).toBe(false);
     expect(resolvePunch("straight", "向右", false)).toEqual({ damage: 0, outcome: "evaded" });
     expect(resolvePunch("hook", null, true)).toEqual({ damage: 3, outcome: "blocked" });
+  });
+
+  it("scales motion thresholds to the calibrated shoulder width", () => {
+    const closeToCamera = createMotionThresholds(0.34);
+    const farFromCamera = createMotionThresholds(0.16);
+    expect(closeToCamera.punchSpeed).toBeGreaterThan(farFromCamera.punchSpeed);
+    expect(closeToCamera.sideDodge).toBeGreaterThan(farFromCamera.sideDodge);
+    expect(getDodgeDirection({ shoulderCenter: 0.59, neutralShoulderCenter: 0.5, noseX: 0.59, noseY: 0.25, shoulderHeight: 0.5, thresholds: farFromCamera })).toBe("向左");
   });
 });

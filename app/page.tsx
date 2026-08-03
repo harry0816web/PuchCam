@@ -2,25 +2,28 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Peer, type DataConnection, type MediaConnection } from "peerjs";
-import { getDodgeDirection, getPunchKind, isBlocking, isWristTracked, resolvePunch, type DodgeDirection, type PunchHand } from "../src/game-rules";
+import { createMotionThresholds, getDodgeDirection, getPunchKind, isBlocking, isWristTracked, resolvePunch, type DodgeDirection, type PunchHand } from "../src/game-rules";
+import { EMPTY_ROUND_STATS, getActionFeedback, getAttackTrajectory, getRoundEndNotice, recordRoundHit, type CombatOutcome } from "../src/game-feedback";
 
 type Fighter = "left" | "right";
 type PunchKind = "straight" | "hook";
-type MaskKind = "frog" | "pig" | "rabbit";
+type MaskKind = "none" | "frog" | "pig" | "rabbit";
 type FacePose = { x: number; y: number; scale: number; pitch: number; yaw: number; roll: number };
 type FaceExpression = { leftBlink: number; rightBlink: number; mouthOpen: number; smile: number };
 type HandPosition = { x: number; y: number };
 type HitEffect = "hit" | "block";
 type TutorialPhase = "explain" | "practice";
+type PlayerRole = "host" | "guest";
+type Calibration = { shoulderWidth: number; thresholds: ReturnType<typeof createMotionThresholds> };
 type EventMessage =
-  | { type: "punch"; kind: PunchKind; hand: PunchHand }
-  | { type: "dodge"; active: boolean; direction?: DodgeDirection }
-  | { type: "block"; active: boolean }
+  | { type: "punch"; kind: PunchKind; hand: PunchHand; sentAt: number }
+  | { type: "combatResult"; attacker: PlayerRole; kind: PunchKind; hand: PunchHand; outcome: CombatOutcome; damage: number }
+  | { type: "dodge"; active: boolean; direction?: DodgeDirection; sentAt: number }
+  | { type: "block"; active: boolean; sentAt: number }
   | { type: "handPosition"; left: HandPosition | null; right: HandPosition | null }
   | { type: "tutorialReady" }
   | { type: "ready" }
-  | { type: "start"; startsAt: number }
-  | { type: "hit"; damage: number };
+  | { type: "start"; startsAt: number };
 
 const ROUND_SECONDS = 60;
 const ROUNDS = 3;
@@ -34,6 +37,13 @@ const TUTORIAL_STEPS = [
 ] as const;
 
 const makeRoomCode = () => Math.random().toString(36).slice(2, 7).toUpperCase();
+const TURN_URL = import.meta.env.VITE_TURN_URL;
+const TURN_USERNAME = import.meta.env.VITE_TURN_USERNAME;
+const TURN_CREDENTIAL = import.meta.env.VITE_TURN_CREDENTIAL;
+const ICE_SERVERS: RTCIceServer[] = [
+  { urls: "stun:stun.l.google.com:19302" },
+  ...(TURN_URL && TURN_USERNAME && TURN_CREDENTIAL ? [{ urls: TURN_URL, username: TURN_USERNAME, credential: TURN_CREDENTIAL }] : []),
+];
 
 export default function Home() {
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -52,7 +62,7 @@ export default function Home() {
   const faceExpressionRef = useRef<FaceExpression>({ leftBlink: 0, rightBlink: 0, mouthOpen: 0, smile: 0 });
   const neutralFacePitchRef = useRef<number | null>(null);
   const lastHandSendRef = useRef(0);
-  const lastWristRef = useRef({ left: 0, right: 0, at: 0 });
+  const lastWristRef = useRef<{ left: { x: number; y: number } | null; right: { x: number; y: number } | null; at: number }>({ left: null, right: null, at: 0 });
   const neutralShoulderXRef = useRef<number | null>(null);
   const cooldownRef = useRef({ left: 0, right: 0 });
   const dodgeRef = useRef(false);
@@ -61,6 +71,11 @@ export default function Home() {
   const startedRef = useRef(false);
   const tutorialReadyRef = useRef(false);
   const opponentTutorialReadyRef = useRef(false);
+  const opponentDodgeRef = useRef<DodgeDirection | null>(null);
+  const opponentBlockRef = useRef(false);
+  const calibrationRef = useRef<Calibration | null>(null);
+  const calibratedRef = useRef(false);
+  const calibrationSamplesRef = useRef<number[]>([]);
   const tutorialStepRef = useRef(0);
   const tutorialPhaseRef = useRef<TutorialPhase>("explain");
   const tutorialPracticeCountRef = useRef(0);
@@ -68,6 +83,7 @@ export default function Home() {
   const countdownRef = useRef(false);
   const retryTimerRef = useRef<number | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
+  const audioSettingsRef = useRef({ muted: false, volume: 0.55 });
 
   const [roomCode, setRoomCode] = useState("");
   const [roomInput, setRoomInput] = useState("");
@@ -81,9 +97,11 @@ export default function Home() {
   const [opponentHealth, setOpponentHealth] = useState(100);
   const [myHits, setMyHits] = useState(0);
   const [opponentHits, setOpponentHits] = useState(0);
-  const [effect, setEffect] = useState<{ side: Fighter; kind: PunchKind } | null>(null);
+  const [roundStats, setRoundStats] = useState(EMPTY_ROUND_STATS);
+  const [effect, setEffect] = useState<{ side: Fighter; kind: PunchKind; hand: PunchHand } | null>(null);
   const [hitEffect, setHitEffect] = useState<HitEffect | null>(null);
   const [gameMessage, setGameMessage] = useState("");
+  const [matchNotice, setMatchNotice] = useState<{ title: string; detail: string } | null>(null);
   const [started, setStarted] = useState(false);
   const [tracking, setTracking] = useState(false);
   const [lastMove, setLastMove] = useState("等待揮拳");
@@ -91,9 +109,18 @@ export default function Home() {
   const [tutorialStep, setTutorialStep] = useState(0);
   const [tutorialPhase, setTutorialPhase] = useState<TutorialPhase>("explain");
   const [tutorialPracticeCount, setTutorialPracticeCount] = useState(0);
+  const [calibrated, setCalibrated] = useState(false);
+  const [calibrationProgress, setCalibrationProgress] = useState(0);
+  const [calibrationGuide, setCalibrationGuide] = useState("請讓臉部、肩膀與雙手完整入鏡。");
   const [tutorialComplete, setTutorialComplete] = useState(false);
   const [hostPeerReady, setHostPeerReady] = useState(false);
   const [mask, setMask] = useState<MaskKind>("frog");
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [muted, setMuted] = useState(false);
+  const [volume, setVolume] = useState(55);
+  const [mirrored, setMirrored] = useState(true);
+  const [showTrackingPoints, setShowTrackingPoints] = useState(true);
+  const [showOpponentGloves, setShowOpponentGloves] = useState(true);
   const [faceTracked, setFaceTracked] = useState(false);
   const [opponentHands, setOpponentHands] = useState<{ left: HandPosition | null; right: HandPosition | null }>({ left: null, right: null });
 
@@ -103,7 +130,7 @@ export default function Home() {
     if (connectionRef.current?.open) connectionRef.current.send(message);
   }, []);
 
-  const playImpactSound = useCallback((blocked: boolean) => {
+  const playActionSound = useCallback((action: "straight" | "hook" | "dodge" | "block" | "hit" | "blocked") => {
     const AudioContextClass = window.AudioContext ?? (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
     if (!AudioContextClass) return;
     const context = audioContextRef.current ?? new AudioContextClass();
@@ -113,22 +140,61 @@ export default function Home() {
     const now = context.currentTime;
     const oscillator = context.createOscillator();
     const gain = context.createGain();
-    oscillator.type = blocked ? "triangle" : "square";
-    oscillator.frequency.setValueAtTime(blocked ? 260 : 170, now);
-    oscillator.frequency.exponentialRampToValueAtTime(blocked ? 120 : 58, now + 0.13);
+    const settings = audioSettingsRef.current;
+    const config = getActionFeedback(action);
+    oscillator.type = config.oscillator;
+    oscillator.frequency.setValueAtTime(config.start, now);
+    oscillator.frequency.exponentialRampToValueAtTime(config.end, now + config.duration);
     gain.gain.setValueAtTime(0.0001, now);
-    gain.gain.exponentialRampToValueAtTime(blocked ? 0.07 : 0.12, now + 0.008);
-    gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.16);
+    gain.gain.exponentialRampToValueAtTime(settings.muted ? 0.0001 : config.gain * settings.volume, now + 0.008);
+    gain.gain.exponentialRampToValueAtTime(0.0001, now + config.duration);
     oscillator.connect(gain).connect(context.destination);
     oscillator.start(now);
-    oscillator.stop(now + 0.17);
+    oscillator.stop(now + config.duration + 0.01);
+    if (!settings.muted) navigator.vibrate?.(config.vibration);
   }, []);
 
   const showHitEffect = useCallback((blocked: boolean) => {
     setHitEffect(blocked ? "block" : "hit");
-    playImpactSound(blocked);
+    playActionSound(blocked ? "blocked" : "hit");
     window.setTimeout(() => setHitEffect(null), 450);
-  }, [playImpactSound]);
+  }, [playActionSound]);
+
+  const resetCalibration = () => {
+    calibratedRef.current = false;
+    calibrationRef.current = null;
+    calibrationSamplesRef.current = [];
+    neutralShoulderXRef.current = null;
+    setCalibrated(false);
+    setCalibrationProgress(0);
+    setCalibrationGuide("請讓臉部、肩膀與雙手完整入鏡。");
+  };
+
+  const applyAuthoritativePunch = useCallback((kind: PunchKind, hand: PunchHand, attacker: PlayerRole) => {
+    // The host is the single authority. It evaluates the defender's latest
+    // announced defensive state and sends one result that both clients apply.
+    if (!isHost || !startedRef.current) return;
+    const defendingHost = attacker === "guest";
+    const result = resolvePunch(kind, defendingHost ? dodgeDirectionRef.current : opponentDodgeRef.current, defendingHost ? blockRef.current : opponentBlockRef.current);
+    const combat = { type: "combatResult" as const, attacker, kind, hand, outcome: result.outcome, damage: result.damage };
+    if (defendingHost) {
+      if (result.outcome !== "evaded") {
+        setMyHealth((health) => Math.max(0, health - result.damage));
+        setOpponentHits((hits) => hits + 1);
+        setRoundStats((stats) => recordRoundHit(stats, "friend", result.damage));
+        showHitEffect(result.outcome === "blocked");
+      }
+      setStatus(result.outcome === "evaded" ? (kind === "straight" ? "漂亮側閃，躲過直拳！" : "下蹲成功，躲過勾拳！") : result.outcome === "blocked" ? "格檔成功，傷害降低！" : "被對手擊中！");
+    } else {
+      if (result.outcome !== "evaded") {
+        setOpponentHealth((health) => Math.max(0, health - result.damage));
+        setMyHits((hits) => hits + 1);
+        setRoundStats((stats) => recordRoundHit(stats, "you", result.damage));
+      }
+      setStatus(result.outcome === "evaded" ? "對手閃過了攻擊！" : result.outcome === "blocked" ? "對手格檔了攻擊。" : "命中對手！");
+    }
+    send(combat);
+  }, [isHost, send, showHitEffect]);
 
   function scheduleMatchStart() {
     if (countdownRef.current || startedRef.current) return;
@@ -141,31 +207,38 @@ export default function Home() {
 
   const receive = useCallback((raw: unknown) => {
     const message = raw as EventMessage;
-    if (message.type === "punch") {
-      setEffect({ side: "right", kind: message.kind });
+    if (message.type === "punch" && isHost) {
+      setEffect({ side: "right", kind: message.kind, hand: message.hand });
       window.setTimeout(() => setEffect(null), 500);
-      if (startedRef.current) {
-        const result = resolvePunch(message.kind, dodgeDirectionRef.current, blockRef.current);
-        if (result.outcome === "evaded") {
-          setStatus(message.kind === "straight" ? "漂亮側閃，躲過直拳！" : "下蹲成功，躲過勾拳！");
-          return;
+      applyAuthoritativePunch(message.kind, message.hand, "guest");
+    }
+    if (message.type === "combatResult" && !isHost) {
+      const defendingGuest = message.attacker === "host";
+      if (defendingGuest) {
+        setEffect({ side: "right", kind: message.kind, hand: message.hand });
+        window.setTimeout(() => setEffect(null), 500);
+        if (message.outcome !== "evaded") {
+          setMyHealth((health) => Math.max(0, health - message.damage));
+          setOpponentHits((hits) => hits + 1);
+          setRoundStats((stats) => recordRoundHit(stats, "friend", message.damage));
+          showHitEffect(message.outcome === "blocked");
         }
-        const damage = result.damage;
-        setMyHealth((health) => Math.max(0, health - damage));
-        setOpponentHits((hits) => hits + 1);
-        send({ type: "hit", damage });
-        const blocked = result.outcome === "blocked";
-        showHitEffect(blocked);
-        if (blocked) setStatus("格檔成功，傷害降低！");
+      } else if (message.outcome !== "evaded") {
+        setOpponentHealth((health) => Math.max(0, health - message.damage));
+        setMyHits((hits) => hits + 1);
+        setRoundStats((stats) => recordRoundHit(stats, "you", message.damage));
       }
+      setStatus(message.outcome === "evaded" ? (defendingGuest ? "漂亮閃躲！" : "對手閃過了攻擊！") : message.outcome === "blocked" ? (defendingGuest ? "格檔成功，傷害降低！" : "對手格檔了攻擊。") : defendingGuest ? "被對手擊中！" : "命中對手！");
     }
-    if (message.type === "dodge") setStatus(message.active ? `對手正在${message.direction ?? ""}閃躲！` : "對手就位");
-    if (message.type === "block") setStatus(message.active ? "對手正在格檔！" : "對手解除格檔");
+    if (message.type === "dodge") {
+      opponentDodgeRef.current = message.active ? message.direction ?? null : null;
+      setStatus(message.active ? `對手正在${message.direction ?? ""}閃躲！` : "對手就位");
+    }
+    if (message.type === "block") {
+      opponentBlockRef.current = message.active;
+      setStatus(message.active ? "對手正在格檔！" : "對手解除格檔");
+    }
     if (message.type === "handPosition") setOpponentHands({ left: message.left, right: message.right });
-    if (message.type === "hit") {
-      setOpponentHealth((health) => Math.max(0, health - message.damage));
-      setMyHits((hits) => hits + 1);
-    }
     if (message.type === "tutorialReady") {
       opponentTutorialReadyRef.current = true;
       setStatus("朋友已完成教學，等待你準備。");
@@ -175,7 +248,7 @@ export default function Home() {
       window.setTimeout(() => startMatch(), Math.max(0, message.startsAt - Date.now()));
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isHost, send, showHitEffect]);
+  }, [applyAuthoritativePunch, isHost, send, showHitEffect]);
 
   const attachConnection = useCallback((connection: DataConnection, callbacks?: { onOpen?: () => void; onFailure?: () => void }) => {
     let opened = false;
@@ -201,8 +274,7 @@ export default function Home() {
     if (outboundStreamRef.current) return outboundStreamRef.current;
     const stream = streamRef.current;
     const video = videoRef.current;
-    const maskCanvas = faceCanvasRef.current;
-    if (!stream || !video || !maskCanvas || !video.videoWidth || !video.videoHeight) return stream ?? undefined;
+    if (!stream || !video || !video.videoWidth || !video.videoHeight) return stream ?? undefined;
 
     const canvas = document.createElement("canvas");
     canvas.width = video.videoWidth;
@@ -213,11 +285,14 @@ export default function Home() {
       context.drawImage(video, 0, 0, canvas.width, canvas.height);
       // The local overlay is mirrored for the self-view; flip it back before
       // compositing it onto the raw outgoing camera frame.
-      context.save();
-      context.translate(canvas.width, 0);
-      context.scale(-1, 1);
-      context.drawImage(maskCanvas, 0, 0, canvas.width, canvas.height);
-      context.restore();
+      const maskCanvas = faceCanvasRef.current;
+      if (maskCanvas) {
+        context.save();
+        context.translate(canvas.width, 0);
+        context.scale(-1, 1);
+        context.drawImage(maskCanvas, 0, 0, canvas.width, canvas.height);
+        context.restore();
+      }
       compositeFrameRef.current = requestAnimationFrame(draw);
     };
     draw();
@@ -248,7 +323,7 @@ export default function Home() {
 
   const joinPeer = useCallback((code: string, host: boolean) => {
     const id = host ? `punch-arena-${code.toLowerCase()}` : undefined;
-    const peer = id ? new Peer(id) : new Peer();
+    const peer = id ? new Peer(id, { config: { iceServers: ICE_SERVERS } }) : new Peer({ config: { iceServers: ICE_SERVERS } });
     peerRef.current = peer;
     peer.on("open", () => {
       if (host) {
@@ -299,6 +374,7 @@ export default function Home() {
     setRoomCode(code);
     setIsHost(true);
     setHostPeerReady(false);
+    resetCalibration();
     await activateCamera();
     joinPeer(code, true);
   };
@@ -308,14 +384,17 @@ export default function Home() {
     if (!code) return setStatus("請輸入朋友分享的房間碼。");
     setRoomCode(code);
     setIsHost(false);
+    resetCalibration();
     await activateCamera();
     joinPeer(code, false);
   };
 
-  const startMatch = () => {
+  const startMatch = (roundNumber = round) => {
     startedRef.current = true;
     setStarted(true);
-    setStatus("第一回合開始！出拳、勾拳或閃躲。 ");
+    setMatchNotice({ title: `ROUND ${roundNumber}`, detail: "FIGHT!" });
+    window.setTimeout(() => setMatchNotice(null), 1100);
+    setStatus(`第 ${roundNumber} 回合開始！出拳、勾拳或閃躲。`);
   };
 
   const finishTutorial = () => {
@@ -366,13 +445,17 @@ export default function Home() {
   }, [isHost, send, tutorialComplete]);
 
   const announcePunch = useCallback((kind: PunchKind, hand: PunchHand) => {
-    setEffect({ side: "left", kind });
+    setEffect({ side: "left", kind, hand });
     setLastMove(`偵測到${hand === "left" ? "左" : "右"}${kind === "straight" ? "直拳" : "勾拳"}！`);
     registerTutorialMove(kind);
     // Preview effects work before the match starts; damage is only shared in a live round.
-    if (startedRef.current) send({ type: "punch", kind, hand });
+    if (startedRef.current) {
+      playActionSound(kind);
+      if (isHost) applyAuthoritativePunch(kind, hand, "host");
+      else send({ type: "punch", kind, hand, sentAt: Date.now() });
+    }
     window.setTimeout(() => setEffect(null), 500);
-  }, [send, registerTutorialMove]);
+  }, [applyAuthoritativePunch, isHost, playActionSound, send, registerTutorialMove]);
 
   const drawPose = useCallback((points: Array<{ x: number; y: number; visibility?: number }>) => {
     const canvas = poseCanvasRef.current;
@@ -419,6 +502,12 @@ export default function Home() {
   useEffect(() => {
     const canvas = faceCanvasRef.current;
     if (!canvas) return;
+    if (mask === "none") {
+      // A WebGL canvas retains its previous rendered frame after the renderer
+      // is disposed. Resetting its buffer removes the last visible head mask.
+      canvas.width = canvas.width;
+      return;
+    }
     let disposed = false;
     let frameId = 0;
     let renderer: any;
@@ -544,19 +633,25 @@ export default function Home() {
 
   useEffect(() => {
     if (!started || (seconds > 0 && myHealth > 0 && opponentHealth > 0)) return;
+    startedRef.current = false;
+    setStarted(false);
+    const notice = getRoundEndNotice({ round, rounds: ROUNDS, myHealth, opponentHealth, stats: roundStats, totalMyHits: myHits, totalOpponentHits: opponentHits });
     if (round < ROUNDS) {
-      setGameMessage(`第 ${round} 回合結束，下一回合準備！`);
-      setRound((value) => value + 1);
-      setSeconds(ROUND_SECONDS);
-      setMyHealth(100);
-      setOpponentHealth(100);
-      window.setTimeout(() => setGameMessage(""), 2500);
+      setMatchNotice(notice);
+      window.setTimeout(() => {
+        setRound((value) => value + 1);
+        setSeconds(ROUND_SECONDS);
+        setMyHealth(100);
+        setOpponentHealth(100);
+        setRoundStats(EMPTY_ROUND_STATS);
+        setMatchNotice(null);
+        startMatch(round + 1);
+      }, 2600);
     } else {
-      setStarted(false);
-      startedRef.current = false;
-      setGameMessage(myHits === opponentHits ? "平手！勢均力敵。" : myHits > opponentHits ? "你獲勝了！" : "朋友獲勝了！");
+      setGameMessage(notice.title);
+      setMatchNotice(notice);
     }
-  }, [started, seconds, myHealth, opponentHealth, round, myHits, opponentHits]);
+  }, [started, seconds, myHealth, opponentHealth, round, myHits, opponentHits, roundStats]);
 
   useEffect(() => {
     let cancelled = false;
@@ -631,8 +726,36 @@ export default function Home() {
             }
             const shoulderCenter = (points[11].x + points[12].x) / 2;
             const shoulderHeight = (points[11].y + points[12].y) / 2;
+            const shoulderWidth = Math.abs(points[12].x - points[11].x);
             const leftWristVisible = isWristTracked(points[15].visibility);
             const rightWristVisible = isWristTracked(points[16].visibility);
+            const distanceGuide = !face
+              ? "請讓整個臉部入鏡，眼睛到下巴不要被裁切。"
+              : shoulderWidth < 0.17
+                ? "你離螢幕太遠，靠近一些，讓肩膀約佔畫面寬度的 1/5 到 1/3。"
+                : shoulderWidth > 0.34
+                  ? "你離螢幕太近，後退一些，避免出拳時手腕離開畫面。"
+                  : !leftWristVisible || !rightWristVisible
+                    ? "距離良好；請將雙手、手肘與手腕完整放入畫面。"
+                    : "距離良好，保持坐姿與雙手位置不動。";
+            if (!calibratedRef.current) setCalibrationGuide((value) => value === distanceGuide ? value : distanceGuide);
+            const calibrationPoseReady = Boolean(face) && shoulderWidth >= 0.17 && shoulderWidth <= 0.34 && leftWristVisible && rightWristVisible;
+            if (!calibratedRef.current && calibrationPoseReady) {
+              calibrationSamplesRef.current.push(shoulderWidth);
+              const sampleCount = calibrationSamplesRef.current.length;
+              const progress = Math.min(100, Math.round((sampleCount / 45) * 100));
+              setCalibrationProgress((value) => value === progress ? value : progress);
+              if (sampleCount >= 45) {
+                const averageShoulderWidth = calibrationSamplesRef.current.reduce((sum, value) => sum + value, 0) / sampleCount;
+                calibrationRef.current = { shoulderWidth: averageShoulderWidth, thresholds: createMotionThresholds(averageShoulderWidth) };
+                neutralShoulderXRef.current = shoulderCenter;
+                calibratedRef.current = true;
+                setCalibrated(true);
+                setCalibrationProgress(100);
+                setCalibrationGuide("校正完成！這個距離最適合辨識出拳與閃躲。");
+                setStatus("姿勢校正完成，現在可開始動作教學。");
+              }
+            }
             const wristsInFrame = Number(leftWristVisible) + Number(rightWristVisible);
             setVisibleWrists((value) => value === wristsInFrame ? value : wristsInFrame);
             if (now - lastHandSendRef.current > 80) {
@@ -652,6 +775,7 @@ export default function Home() {
               noseX: points[0].x,
               noseY: points[0].y,
               shoulderHeight,
+              thresholds: calibrationRef.current?.thresholds,
             });
             const dodging = dodgeDirection !== null;
             // Slowly re-centre only while neutral, so a deliberate dodge isn't absorbed as a new baseline.
@@ -659,9 +783,10 @@ export default function Home() {
             if (dodging) dodgeDirectionRef.current = dodgeDirection;
             if (dodging !== dodgeRef.current) {
               dodgeRef.current = dodging;
-              send({ type: "dodge", active: dodging, direction: dodgeDirection ?? undefined });
+              send({ type: "dodge", active: dodging, direction: dodgeDirection ?? undefined, sentAt: Date.now() });
               if (dodging) {
                 setLastMove(`偵測到${dodgeDirection}閃躲！`);
+                playActionSound("dodge");
                 registerTutorialMove(dodgeDirection === "下蹲" ? "duck" : "side");
               }
             }
@@ -676,16 +801,17 @@ export default function Home() {
             });
             if (blocking !== blockRef.current) {
               blockRef.current = blocking;
-              send({ type: "block", active: blocking });
+              send({ type: "block", active: blocking, sentAt: Date.now() });
               if (blocking) {
                 setLastMove("偵測到格檔！受到傷害降低 80%");
+                playActionSound("block");
                 registerTutorialMove("block");
               }
             }
             ([{ key: "left", wrist: points[15], elbow: points[13], shoulder: points[11], visible: leftWristVisible }, { key: "right", wrist: points[16], elbow: points[14], shoulder: points[12], visible: rightWristVisible }] as const).forEach(({ key, wrist, elbow, shoulder, visible }) => {
               const previous = lastWristRef.current[key];
-              const speed = previous ? Math.abs(wrist.x - previous) / Math.max(1, now - lastWristRef.current.at) : 0;
-              const punchKind = getPunchKind({ speed, wrist, elbow, shoulder });
+              const speed = previous ? Math.hypot(wrist.x - previous.x, wrist.y - previous.y) / Math.max(1, now - lastWristRef.current.at) : 0;
+              const punchKind = getPunchKind({ speed, wrist, elbow, shoulder, thresholds: calibrationRef.current?.thresholds });
               // A hand must be confidently visible to attack. When neither wrist is
               // visible, only the head-and-shoulder dodge rule remains active.
               if (visible && !dodging && !blocking && now > cooldownRef.current[key] && punchKind) {
@@ -694,7 +820,7 @@ export default function Home() {
               }
               // Prevent the end of a dodge from immediately becoming a hook.
               if (dodging || blocking) cooldownRef.current[key] = now + 250;
-              lastWristRef.current[key] = wrist.x;
+              lastWristRef.current[key] = { x: wrist.x, y: wrist.y };
             });
             lastWristRef.current.at = now;
           } else {
@@ -713,7 +839,7 @@ export default function Home() {
     };
     if (cameraReady) runDetection().catch(() => setStatus("動作辨識載入失敗，但視訊連線仍可使用。"));
     return () => { cancelled = true; if (animationRef.current) cancelAnimationFrame(animationRef.current); };
-  }, [cameraReady, announcePunch, send, drawPose, registerTutorialMove]);
+  }, [cameraReady, announcePunch, send, drawPose, playActionSound, registerTutorialMove]);
 
   useEffect(() => () => {
     if (retryTimerRef.current !== null) window.clearTimeout(retryTimerRef.current);
@@ -732,11 +858,19 @@ export default function Home() {
       <section className="arena-shell">
         <header>
           <div className="brand"><span>✦</span> PUNCH//CAM</div>
+          {roomCode && <div className="header-room"><div><label>ROOM CODE</label><b>{roomCode}</b></div>{isHost && <button className="copy" disabled={!hostPeerReady} onClick={() => navigator.clipboard.writeText(roomLink)}>{hostPeerReady ? "複製邀請連結" : "正在建立房間…"}</button>}<p title={gameMessage || status}>{gameMessage || status} <span className="move-readout">{visibleWrists === 0 ? "手腕未入鏡：僅可閃躲" : lastMove}</span></p></div>}
           <div className="round-pill">ROUND {round} <b>{String(seconds).padStart(2, "0")}</b></div>
-          <div className={`connection ${connected ? "online" : ""}`}>{connected ? "● LIVE" : "○ WAITING"}</div>
+          <div className="header-actions"><button className="settings-button" onClick={() => setSettingsOpen((open) => !open)} aria-expanded={settingsOpen}>⚙ 設定</button><div className={`connection ${connected ? "online" : ""}`}>{connected ? "● LIVE" : "○ WAITING"}</div></div>
         </header>
 
-        {roomCode && connected && !started && !tutorialComplete && <section className="tutorial-overlay" aria-label="動作教學">
+        {settingsOpen && <aside className="settings-panel" aria-label="遊戲設定"><div><label>音量 {muted ? "（靜音）" : `${volume}%`}</label><input type="range" min="0" max="100" value={volume} onChange={(event) => { const next = Number(event.target.value); setVolume(next); audioSettingsRef.current.volume = next / 100; }} /></div><label><input type="checkbox" checked={muted} onChange={(event) => { setMuted(event.target.checked); audioSettingsRef.current.muted = event.target.checked; }} /> 靜音音效</label><label><input type="checkbox" checked={mirrored} onChange={(event) => setMirrored(event.target.checked)} /> 鏡像我的畫面</label><label><input type="checkbox" checked={showTrackingPoints} onChange={(event) => setShowTrackingPoints(event.target.checked)} /> 顯示追蹤點</label><label><input type="checkbox" checked={showOpponentGloves} onChange={(event) => setShowOpponentGloves(event.target.checked)} /> 顯示對手拳套</label></aside>}
+
+        {roomCode && connected && !calibrated && <section className="tutorial-overlay calibration-overlay" aria-label="姿勢校正">
+          <div className="tutorial-copy"><p>姿勢校正</p><h2>坐正並看向鏡頭</h2><span>臉部、肩膀、手肘與雙手腕都要入鏡；我們會依你的身形校正動作判定。</span><strong className="calibration-guide" aria-live="polite">{calibrationGuide}</strong><strong className="tutorial-count" aria-live="polite">{calibrationProgress}%</strong></div>
+          <div className="calibration-progress" aria-hidden="true"><i style={{ width: `${calibrationProgress}%` }} /></div>
+        </section>}
+
+        {roomCode && connected && calibrated && !started && !tutorialComplete && <section className="tutorial-overlay" aria-label="動作教學">
           <div className="tutorial-top"><span>動作教學 {tutorialStep + 1} / {TUTORIAL_STEPS.length}</span><div className="tutorial-progress"><i style={{ width: `${((tutorialStep + 1) / TUTORIAL_STEPS.length) * 100}%` }} /></div></div>
           <div className={`coach-canvas ${lesson.key}`} aria-hidden="true"><div className="coach-head" /><div className="coach-body" /><i className="coach-arm left" /><i className="coach-arm right" /><i className="coach-leg left" /><i className="coach-leg right" /><b className="coach-effect">{lesson.key === "block" ? "GUARD" : lesson.key === "duck" ? "DUCK" : lesson.key === "side" ? "SWAY" : "POW!"}</b></div>
           <div className="tutorial-copy"><p>MOVE {String(tutorialStep + 1).padStart(2, "0")}</p><h2>{lesson.title}</h2><span>{tutorialPhase === "explain" ? lesson.note : `現在請成功做出這個動作兩次。`}</span>{tutorialPhase === "practice" && <strong className="tutorial-count" aria-live="polite">成功 {tutorialPracticeCount} / 2</strong>}</div>
@@ -751,18 +885,20 @@ export default function Home() {
           <div className="join-row"><input value={roomInput} onChange={(event) => setRoomInput(event.target.value)} maxLength={5} placeholder="輸入房間碼" aria-label="房間碼" /><button onClick={joinRoom}>加入</button></div>
           <div className="moves"><span>直拳</span><span>勾拳</span><span>閃躲</span></div>
         </section> : <>
-          <section className="scoreboard">
-            <div><label>YOU</label><strong>{myHealth}</strong><div className="health"><i style={{ width: `${myHealth}%` }} /></div><small>{myHits} HITS</small></div>
-            <div className="vs">VS</div>
-            <div className="opponent"><label>FRIEND</label><strong>{opponentHealth}</strong><div className="health"><i style={{ width: `${opponentHealth}%` }} /></div><small>{opponentHits} HITS</small></div>
+          <section className="game-stage">
+            <section className="video-grid">
+              <section className="scoreboard">
+                <div><label>FRIEND</label><strong>{opponentHealth}</strong><div className="health"><i style={{ width: `${opponentHealth}%` }} /></div><small>{opponentHits} HITS</small></div>
+                <div className="vs">VS</div>
+                <div className="opponent"><label>YOU</label><strong>{myHealth}</strong><div className="health"><i style={{ width: `${myHealth}%` }} /></div><small>{myHits} HITS</small></div>
+              </section>
+              <section className="round-stats" aria-label="本回合統計"><span>本回合</span><b>你：{roundStats.you.hits} 擊 · {roundStats.you.damage} 傷害</b><b>對手：{roundStats.friend.hits} 擊 · {roundStats.friend.damage} 傷害</b></section>
+              <article className="fighter you"><video ref={videoRef} className={mirrored ? "" : "unmirrored"} autoPlay muted playsInline />{showTrackingPoints && <canvas ref={poseCanvasRef} className="pose-overlay" />}{mask !== "none" && <canvas ref={faceCanvasRef} className="three-mask-overlay" />}<div className="mask-picker" aria-label="選擇 3D 頭套">{([{ key: "none", emoji: "🚫" }, { key: "frog", emoji: "🐸" }, { key: "pig", emoji: "🐷" }, { key: "rabbit", emoji: "🐰" }] as const).map(({ key, emoji }) => <button key={key} className={mask === key ? "selected" : ""} onClick={() => setMask(key)} aria-label={`選擇 ${emoji} 頭套`}>{emoji}</button>)}</div><span className={`face-tracking ${faceTracked ? "active" : ""}`}>{faceTracked ? "● 3D FACE" : "○ 找不到臉部"}</span><span className={`tracking ${tracking ? "active" : ""}`}>{tracking ? "● 上半身追蹤中" : "○ 找不到上半身"}</span><span className="tag">YOU</span>{effect?.side === "left" && <div className={`attack-fx ${effect.kind} ${effect.hand} ${getAttackTrajectory(effect.kind, effect.hand)}`}><i /><i /><i /><b>{effect.kind === "straight" ? "KAPOW!" : "WHAM!"}</b></div>}{hitEffect && <div className={`damage-fx ${hitEffect}`} aria-live="polite"><i /><i /><b>{hitEffect === "block" ? "BLOCK!" : "HIT!"}</b></div>}</article>
+              <article className="fighter friend"><video ref={opponentVideoRef} autoPlay playsInline />{showOpponentGloves && opponentHands.left && <span className="opponent-glove left" style={{ left: `${opponentHands.left.x * 100}%`, top: `${opponentHands.left.y * 100}%` }}>🥊</span>}{showOpponentGloves && opponentHands.right && <span className="opponent-glove right" style={{ left: `${opponentHands.right.x * 100}%`, top: `${opponentHands.right.y * 100}%` }}>🥊</span>}<span className="tag">FRIEND</span>{effect?.side === "right" && <div className={`attack-fx ${effect.kind} ${effect.hand} ${getAttackTrajectory(effect.kind, effect.hand)}`}><i /><i /><i /><b>{effect.kind === "straight" ? "KAPOW!" : "WHAM!"}</b></div>} {!connected && <div className="waiting">等待對手<br /><small>分享右側連結</small></div>}</article>
+            </section>
           </section>
-          <section className="video-grid">
-            <article className="fighter you"><video ref={videoRef} autoPlay muted playsInline /><canvas ref={poseCanvasRef} className="pose-overlay" /><canvas ref={faceCanvasRef} className="three-mask-overlay" /><div className="mask-picker" aria-label="選擇 3D 頭套">{([{ key: "frog", emoji: "🐸" }, { key: "pig", emoji: "🐷" }, { key: "rabbit", emoji: "🐰" }] as const).map(({ key, emoji }) => <button key={key} className={mask === key ? "selected" : ""} onClick={() => setMask(key)} aria-label={`選擇 ${emoji} 3D 頭套`}>{emoji}</button>)}</div><span className={`face-tracking ${faceTracked ? "active" : ""}`}>{faceTracked ? "● 3D FACE" : "○ 找不到臉部"}</span><span className={`tracking ${tracking ? "active" : ""}`}>{tracking ? "● 上半身追蹤中" : "○ 找不到上半身"}</span><span className="tag">YOU</span>{effect?.side === "left" && <div className={`attack-fx ${effect.kind}`}><i /><i /><i /><b>{effect.kind === "straight" ? "KAPOW!" : "WHAM!"}</b></div>}{hitEffect && <div className={`damage-fx ${hitEffect}`} aria-live="polite"><i /><i /><b>{hitEffect === "block" ? "BLOCK!" : "HIT!"}</b></div>}</article>
-            <article className="fighter friend"><video ref={opponentVideoRef} autoPlay playsInline />{opponentHands.left && <span className="opponent-glove left" style={{ left: `${opponentHands.left.x * 100}%`, top: `${opponentHands.left.y * 100}%` }}>🥊</span>}{opponentHands.right && <span className="opponent-glove right" style={{ left: `${opponentHands.right.x * 100}%`, top: `${opponentHands.right.y * 100}%` }}>🥊</span>}<span className="tag">FRIEND</span>{effect?.side === "right" && <div className={`attack-fx ${effect.kind}`}><i /><i /><i /><b>{effect.kind === "straight" ? "KAPOW!" : "WHAM!"}</b></div>} {!connected && <div className="waiting">等待對手<br /><small>分享下方連結</small></div>}</article>
-          </section>
-          <section className="room-card"><div><label>ROOM CODE</label><b>{roomCode}</b></div>{isHost && <button className="copy" disabled={!hostPeerReady} onClick={() => navigator.clipboard.writeText(roomLink)}>{hostPeerReady ? "複製邀請連結" : "正在建立房間…"}</button>}<p>{gameMessage || status} <span className="move-readout">{visibleWrists === 0 ? "手腕未入鏡：僅可閃躲" : lastMove}</span></p></section>
+          {matchNotice && <section className="match-notice" aria-live="assertive"><strong>{matchNotice.title}</strong><span>{matchNotice.detail}</span></section>}
         </>}
-        <footer>坐著即可玩：肩膀、雙手與頭部保持入鏡 · 對手側身即可閃躲</footer>
       </section>
     </main>
   );

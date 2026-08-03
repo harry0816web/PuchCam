@@ -11,6 +11,9 @@ export const GUARD_HEIGHT_RATIO = 0.32;
 // while real strikes peak well above it.
 export const PUNCH_SPEED_THRESHOLD = 0.0018;
 export const STRAIGHT_EXTENSION_RATIO = 1.65;
+// Players rarely punch perfectly vertical in camera coordinates. Allow a
+// diagonal straight; only strongly sideward extension is considered a hook.
+export const STRAIGHT_LATERAL_RATIO = 0.95;
 export const SIDE_DODGE_THRESHOLD = 0.075;
 export const DUCK_DODGE_THRESHOLD = 0.105;
 
@@ -42,11 +45,14 @@ export function isBlocking({ leftWrist, rightWrist, wristsTracked }: { leftWrist
   return wristsTracked && leftWrist.y < GUARD_HEIGHT_RATIO && rightWrist.y < GUARD_HEIGHT_RATIO && Math.abs(leftWrist.x - rightWrist.x) < 0.42;
 }
 
-export function getPunchKind({ speed, wrist, elbow, shoulder, thresholds }: { speed: number; wrist: Point; elbow: Point; shoulder: Point; thresholds?: MotionThresholds }): PunchKind | null {
+export function getPunchKind({ speed, wrist, elbow, shoulder, hand, bodyCenterX, thresholds }: { speed: number; wrist: Point; elbow: Point; shoulder: Point; hand?: PunchHand; bodyCenterX?: number; thresholds?: MotionThresholds }): PunchKind | null {
   if (speed <= (thresholds?.punchSpeed ?? PUNCH_SPEED_THRESHOLD)) return null;
+  const crossedBodyMidline = hand !== undefined && bodyCenterX !== undefined && (hand === "left" ? wrist.x < bodyCenterX : wrist.x > bodyCenterX);
+  if (crossedBodyMidline) return "hook";
   const wristDistance = Math.hypot(wrist.x - shoulder.x, wrist.y - shoulder.y);
   const elbowDistance = Math.hypot(elbow.x - shoulder.x, elbow.y - shoulder.y);
-  return wristDistance > elbowDistance * STRAIGHT_EXTENSION_RATIO ? "straight" : "hook";
+  const lateralRatio = Math.abs(wrist.x - shoulder.x) / (Math.abs(wrist.y - shoulder.y) + 0.01);
+  return wristDistance > elbowDistance * STRAIGHT_EXTENSION_RATIO && lateralRatio <= STRAIGHT_LATERAL_RATIO ? "straight" : null;
 }
 
 export function damageForPunch(kind: PunchKind, isBlocking: boolean) {

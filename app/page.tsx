@@ -6,6 +6,8 @@ import { damageForPunch, getDodgeDirection, getPunchKind, isBlocking, isWristTra
 
 type Fighter = "left" | "right";
 type PunchKind = "straight" | "hook";
+type MaskKind = "frog" | "pig" | "rabbit";
+type FacePose = { x: number; y: number; scale: number; pitch: number; yaw: number; roll: number };
 type EventMessage =
   | { type: "punch"; kind: PunchKind }
   | { type: "dodge"; active: boolean }
@@ -31,12 +33,16 @@ const makeRoomCode = () => Math.random().toString(36).slice(2, 7).toUpperCase();
 export default function Home() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const poseCanvasRef = useRef<HTMLCanvasElement>(null);
+  const faceCanvasRef = useRef<HTMLCanvasElement>(null);
   const opponentVideoRef = useRef<HTMLVideoElement>(null);
   const peerRef = useRef<Peer | null>(null);
   const connectionRef = useRef<DataConnection | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const animationRef = useRef<number | null>(null);
   const detectorRef = useRef<any>(null);
+  const faceDetectorRef = useRef<any>(null);
+  const facePoseRef = useRef<FacePose | null>(null);
+  const neutralFacePitchRef = useRef<number | null>(null);
   const lastWristRef = useRef({ left: 0, right: 0, at: 0 });
   const neutralShoulderXRef = useRef<number | null>(null);
   const cooldownRef = useRef({ left: 0, right: 0 });
@@ -69,6 +75,8 @@ export default function Home() {
   const [tutorialStep, setTutorialStep] = useState(0);
   const [tutorialComplete, setTutorialComplete] = useState(false);
   const [hostPeerReady, setHostPeerReady] = useState(false);
+  const [mask, setMask] = useState<MaskKind>("frog");
+  const [faceTracked, setFaceTracked] = useState(false);
 
   const roomLink = typeof window === "undefined" || !roomCode ? "" : `${window.location.origin}${window.location.pathname}?room=${roomCode}`;
 
@@ -283,6 +291,88 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
+    const canvas = faceCanvasRef.current;
+    if (!canvas) return;
+    let disposed = false;
+    let frameId = 0;
+    let renderer: any;
+
+    const mountMask = async () => {
+      const THREE = await import("three");
+      if (disposed) return;
+      renderer = new THREE.WebGLRenderer({ canvas, alpha: true, antialias: true });
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      const scene = new THREE.Scene();
+      const camera = new THREE.PerspectiveCamera(34, 1, 0.1, 20);
+      camera.position.z = 3;
+      scene.add(new THREE.AmbientLight(0xffffff, 1.8));
+      const keyLight = new THREE.DirectionalLight(0xffffff, 2.5);
+      keyLight.position.set(1, 2, 3);
+      scene.add(keyLight);
+
+      const material = (color: number) => new THREE.MeshStandardMaterial({ color, roughness: 0.65, metalness: 0.05 });
+      const orb = (color: number, radius: number, position: [number, number, number], scale?: [number, number, number]) => {
+        const mesh = new THREE.Mesh(new THREE.SphereGeometry(radius, 24, 18), material(color));
+        mesh.position.set(...position);
+        if (scale) mesh.scale.set(...scale);
+        return mesh;
+      };
+      const group = new THREE.Group();
+      if (mask === "frog") {
+        group.add(orb(0x63c95b, 0.38, [0, 0, 0]));
+        [[-0.2, 0.22], [0.2, 0.22]].forEach(([x, y]) => {
+          group.add(orb(0x75e26d, 0.14, [x, y, 0.26]));
+          group.add(orb(0xffffff, 0.08, [x, y, 0.38]));
+          group.add(orb(0x151515, 0.04, [x, y, 0.45]));
+        });
+        group.add(orb(0xb0ee8b, 0.25, [0, -0.12, 0.3], [1.1, 0.48, 0.4]));
+      }
+      if (mask === "pig") {
+        group.add(orb(0xff8db0, 0.39, [0, 0, 0]));
+        group.add(orb(0xffa7c2, 0.2, [0, -0.05, 0.34], [1.22, 0.62, 0.38]));
+        [[-0.08, -0.05], [0.08, -0.05]].forEach(([x, y]) => group.add(orb(0x9d4162, 0.035, [x, y, 0.44], [1, 1.4, 0.5])));
+        [[-0.28, 0.25], [0.28, 0.25]].forEach(([x, y]) => group.add(orb(0xff8db0, 0.16, [x, y, 0], [1.15, 0.75, 0.5])));
+      }
+      if (mask === "rabbit") {
+        group.add(orb(0xf7f3eb, 0.37, [0, 0, 0]));
+        [[-0.16, 0.43], [0.16, 0.43]].forEach(([x, y]) => {
+          group.add(orb(0xf7f3eb, 0.16, [x, y, -0.02], [0.78, 2.2, 0.55]));
+          group.add(orb(0xffb6ca, 0.08, [x, y, 0.12], [0.5, 1.65, 0.35]));
+        });
+        group.add(orb(0xffa6bd, 0.075, [0, -0.06, 0.37], [1.25, 0.72, 0.5]));
+      }
+      scene.add(group);
+
+      const render = () => {
+        if (disposed) return;
+        const width = canvas.clientWidth;
+        const height = canvas.clientHeight;
+        if (width && height && (canvas.width !== width * renderer.getPixelRatio() || canvas.height !== height * renderer.getPixelRatio())) {
+          renderer.setSize(width, height, false);
+          camera.aspect = width / height;
+          camera.updateProjectionMatrix();
+        }
+        const pose = facePoseRef.current;
+        group.visible = Boolean(pose);
+        if (pose) {
+          group.position.set((pose.x - 0.5) * 2.1, (0.5 - pose.y) * 1.55, 0);
+          group.scale.setScalar(pose.scale);
+          group.rotation.set(pose.pitch, pose.yaw, pose.roll);
+        }
+        renderer.render(scene, camera);
+        frameId = requestAnimationFrame(render);
+      };
+      render();
+    };
+    mountMask();
+    return () => {
+      disposed = true;
+      cancelAnimationFrame(frameId);
+      renderer?.dispose();
+    };
+  }, [mask]);
+
+  useEffect(() => {
     const fromUrl = new URLSearchParams(window.location.search).get("room");
     if (fromUrl) setRoomInput(fromUrl.toUpperCase());
   }, []);
@@ -319,6 +409,11 @@ export default function Home() {
         runningMode: "VIDEO",
         numPoses: 1,
       });
+      faceDetectorRef.current = await vision.FaceLandmarker.createFromOptions(fileset, {
+        baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task" },
+        runningMode: "VIDEO",
+        numFaces: 1,
+      });
       const frame = () => {
         const video = videoRef.current;
         if (!cancelled && video && video.readyState >= 2 && detectorRef.current) {
@@ -328,6 +423,41 @@ export default function Home() {
             setTracking((value) => value || true);
             drawPose(points);
             const now = performance.now();
+            const face = faceDetectorRef.current?.detectForVideo(video, now).faceLandmarks?.[0];
+            if (face) {
+              const nose = face[1];
+              const leftEye = face[33];
+              const rightEye = face[263];
+              const leftEdge = face[234];
+              const rightEdge = face[454];
+              const forehead = face[10];
+              const chin = face[152];
+              const faceWidth = Math.abs(rightEdge.x - leftEdge.x);
+              const faceHeight = Math.abs(chin.y - forehead.y);
+              const faceCenter = (leftEdge.x + rightEdge.x) / 2;
+              const faceMiddleY = (forehead.y + chin.y) / 2;
+              const eyeLine = (leftEye.y + rightEye.y) / 2;
+              const verticalFaceSpan = Math.max(chin.y - eyeLine, 0.01);
+              const pitchRatio = (nose.y - eyeLine) / verticalFaceSpan;
+              if (neutralFacePitchRef.current === null) neutralFacePitchRef.current = pitchRatio;
+              facePoseRef.current = {
+                // Centre and scale the mask from the whole face bounding area,
+                // rather than only the nose, so it covers the entire head.
+                x: 1 - faceCenter,
+                y: faceMiddleY,
+                scale: Math.max(0.85, Math.min(2.4, Math.max(faceWidth, faceHeight) * 4.6)),
+                // Compare nose height against the neutral eye-to-chin proportion to tilt the 3D head.
+                pitch: Math.max(-0.55, Math.min(0.55, (pitchRatio - neutralFacePitchRef.current) * 5)),
+                // The camera preview is mirrored, so reverse raw face yaw for the 3D mask.
+                yaw: -Math.max(-0.7, Math.min(0.7, ((nose.x - faceCenter) / Math.max(faceWidth, 0.01)) * 1.7)),
+                roll: -Math.atan2(rightEye.y - leftEye.y, rightEye.x - leftEye.x),
+              };
+              setFaceTracked((value) => value || true);
+            } else {
+              facePoseRef.current = null;
+              neutralFacePitchRef.current = null;
+              setFaceTracked(false);
+            }
             const shoulderCenter = (points[11].x + points[12].x) / 2;
             const shoulderHeight = (points[11].y + points[12].y) / 2;
             const leftWristVisible = isWristTracked(points[15].visibility);
@@ -383,6 +513,9 @@ export default function Home() {
           } else {
             setTracking(false);
             setVisibleWrists(0);
+            facePoseRef.current = null;
+            neutralFacePitchRef.current = null;
+            setFaceTracked(false);
             const canvas = poseCanvasRef.current;
             canvas?.getContext("2d")?.clearRect(0, 0, canvas.width, canvas.height);
           }
@@ -433,8 +566,8 @@ export default function Home() {
             <div className="opponent"><label>FRIEND</label><strong>{opponentHealth}</strong><div className="health"><i style={{ width: `${opponentHealth}%` }} /></div><small>{opponentHits} HITS</small></div>
           </section>
           <section className="video-grid">
-            <article className="fighter you"><video ref={videoRef} autoPlay muted playsInline /><canvas ref={poseCanvasRef} className="pose-overlay" /><span className={`tracking ${tracking ? "active" : ""}`}>{tracking ? "● 上半身追蹤中" : "○ 找不到上半身"}</span><span className="tag">YOU</span>{effect?.side === "left" && <div className={`impact ${effect.kind}`}>POW!</div>}</article>
-            <article className="fighter friend"><video ref={opponentVideoRef} autoPlay playsInline /><span className="tag">FRIEND</span>{effect?.side === "right" && <div className={`impact ${effect.kind}`}>BAM!</div>} {!connected && <div className="waiting">等待對手<br /><small>分享下方連結</small></div>}</article>
+            <article className="fighter you"><video ref={videoRef} autoPlay muted playsInline /><canvas ref={poseCanvasRef} className="pose-overlay" /><canvas ref={faceCanvasRef} className="three-mask-overlay" /><div className="mask-picker" aria-label="選擇 3D 頭套">{([{ key: "frog", emoji: "🐸" }, { key: "pig", emoji: "🐷" }, { key: "rabbit", emoji: "🐰" }] as const).map(({ key, emoji }) => <button key={key} className={mask === key ? "selected" : ""} onClick={() => setMask(key)} aria-label={`選擇 ${emoji} 3D 頭套`}>{emoji}</button>)}</div><span className={`face-tracking ${faceTracked ? "active" : ""}`}>{faceTracked ? "● 3D FACE" : "○ 找不到臉部"}</span><span className={`tracking ${tracking ? "active" : ""}`}>{tracking ? "● 上半身追蹤中" : "○ 找不到上半身"}</span><span className="tag">YOU</span>{effect?.side === "left" && <div className={`attack-fx ${effect.kind}`}><i /><i /><i /><b>{effect.kind === "straight" ? "KAPOW!" : "WHAM!"}</b></div>}</article>
+            <article className="fighter friend"><video ref={opponentVideoRef} autoPlay playsInline /><span className="tag">FRIEND</span>{effect?.side === "right" && <div className={`attack-fx ${effect.kind}`}><i /><i /><i /><b>{effect.kind === "straight" ? "KAPOW!" : "WHAM!"}</b></div>} {!connected && <div className="waiting">等待對手<br /><small>分享下方連結</small></div>}</article>
           </section>
           <section className="room-card"><div><label>ROOM CODE</label><b>{roomCode}</b></div>{isHost && <button className="copy" disabled={!hostPeerReady} onClick={() => navigator.clipboard.writeText(roomLink)}>{hostPeerReady ? "複製邀請連結" : "正在建立房間…"}</button>}<p>{gameMessage || status} <span className="move-readout">{visibleWrists === 0 ? "手腕未入鏡：僅可閃躲" : lastMove}</span></p></section>
         </>}

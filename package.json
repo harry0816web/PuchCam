@@ -11,7 +11,10 @@
     "preview": "vite preview",
     "lint": "tsc --noEmit",
     "test": "vitest run src",
-    "test:e2e": "playwright test"
+    "test:e2e": "playwright test",
+    "memoji:record": "/usr/bin/python3 tools/memoji/record_memoji.py",
+    "memoji:build": "node tools/memoji/build-memoji.mjs",
+    "memoji:rebuild": "node tools/memoji/build-memoji.mjs --force"
   },
   "dependencies": {
     "@mediapipe/tasks-vision": "^1.0.1",

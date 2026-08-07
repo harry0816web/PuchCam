@@ -94,6 +94,78 @@ http://localhost:5173
 For the best experience, allow camera and microphone permissions when the
 browser asks.
 
+## Memoji Headgear Pipeline
+
+PunchCam can turn Apple Memoji recordings into transparent WebP frame sets that
+appear as selectable headgear in the camera view.
+
+Record each Memoji as a video in iMessage or FaceTime, keeping your face at a
+steady distance while slowly rotating or tilting through the motion you want.
+Save each `.mov`, `.mp4`, or `.m4v` file into:
+
+```text
+inputs/memoji/
+```
+
+Then run:
+
+```bash
+npm run memoji:build
+```
+
+The pipeline uses macOS AVFoundation to preserve the alpha channel, extracts
+transparent PNG frames, auto-detects the visible alpha bounds, crops with
+padding, converts the frames to WebP, and writes manifests under:
+
+```text
+public/assets/memoji/
+```
+
+Generated Memoji sets are discovered automatically by the app through
+`public/assets/memoji/index.json`. Restart the dev server or refresh the page,
+then select the `ME` button in the headgear picker.
+
+Useful options:
+
+```bash
+npm run memoji:build -- --every 2 --quality 85 --padding 18
+npm run memoji:rebuild
+```
+
+Requirements for this pipeline:
+
+- macOS
+- Xcode Command Line Tools for `swift`
+- WebP tools for `cwebp`, installable with `brew install webp`
+
+### Coached Recording Helper
+
+If you want PunchCam to prompt the Apple Memoji recording motions for you, run:
+
+```bash
+npm run memoji:record
+```
+
+The helper opens a local browser coach page and shows a `3, 2, 1` countdown
+before each take. It does not record your webcam by default. Keep the coach page
+visible, start recording the actual Apple Memoji in Messages/FaceTime/iPhone,
+and follow the prompts.
+
+After exporting the Apple Memoji `.mov`, save it directly into `inputs/memoji/`,
+then run `npm run memoji:build`.
+
+Useful options:
+
+```bash
+npm run memoji:record -- --port 5199
+npm run memoji:record -- --takes tools/memoji/my-takes.json
+npm run memoji:record -- --record-camera --device 1 --prefix harry-reference
+```
+
+`--record-camera` is only for optional reference recordings. Those camera clips
+do not contain Apple Memoji transparency and should not be used as final headgear
+assets.
+
 ## Build
 
 Create a production build:

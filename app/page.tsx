@@ -9,7 +9,8 @@ import { BOSS_ATTACKS, BOSS_HIT_IMAGE, BOSS_WINDUP_IMAGE, getBossAttackTimeline,
 
 type Fighter = "left" | "right";
 type PunchKind = "straight" | "hook";
-type MaskKind = "none" | "frog" | "pig" | "rabbit";
+type BuiltInMaskKind = "none" | "frog" | "pig" | "rabbit";
+type MaskKind = BuiltInMaskKind | `memoji:${string}`;
 type FacePose = { x: number; y: number; scale: number; pitch: number; yaw: number; roll: number };
 type FaceExpression = { leftBlink: number; rightBlink: number; mouthOpen: number; smile: number };
 type HandPosition = { x: number; y: number };
@@ -18,6 +19,8 @@ type TutorialPhase = "explain" | "practice";
 type PlayerRole = "host" | "guest";
 type GameMode = "raid" | "duel";
 type Calibration = { shoulderWidth: number; thresholds: ReturnType<typeof createMotionThresholds> };
+type MemojiIndexItem = { id: string; title: string; frameCount: number; width: number; height: number; defaultFrame: string; manifest: string };
+type MemojiManifest = MemojiIndexItem & { frames: string[] };
 type EventMessage =
   | { type: "punch"; kind: PunchKind; hand: PunchHand; sentAt: number }
   | { type: "combatResult"; attacker: PlayerRole; kind: PunchKind; hand: PunchHand; outcome: CombatOutcome; damage: number }
@@ -103,6 +106,8 @@ export default function Home() {
   const bossAttackTimersRef = useRef<number[]>([]);
   const bossHitTimerRef = useRef<number | null>(null);
   const nextBossAttackRef = useRef(0);
+  const memojiManifestCacheRef = useRef<Record<string, MemojiManifest>>({});
+  const memojiFrameCacheRef = useRef<Record<string, HTMLImageElement[]>>({});
 
   const [gameMode, setGameMode] = useState<GameMode>("raid");
   const [roomCode, setRoomCode] = useState("");
@@ -153,6 +158,7 @@ export default function Home() {
   const [bossAttackPhase, setBossAttackPhase] = useState<BossAttackPhase>("idle");
   const [bossAttackResult, setBossAttackResult] = useState("");
   const [bossHitFrame, setBossHitFrame] = useState(false);
+  const [memojiMasks, setMemojiMasks] = useState<MemojiIndexItem[]>([]);
 
   const roomLink = typeof window === "undefined" || !roomCode ? "" : `${window.location.origin}${window.location.pathname}?room=${roomCode}&mode=${gameMode}`;
 
@@ -665,9 +671,24 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
+    let cancelled = false;
+    fetch("/assets/memoji/index.json")
+      .then((response) => response.ok ? response.json() : { items: [] })
+      .then((index: { items?: MemojiIndexItem[] }) => {
+        if (!cancelled) setMemojiMasks(index.items ?? []);
+      })
+      .catch(() => {
+        if (!cancelled) setMemojiMasks([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
     const canvas = faceCanvasRef.current;
     if (!canvas) return;
-    if (mask === "none") {
+    if (mask === "none" || mask.startsWith("memoji:")) {
       // A WebGL canvas retains its previous rendered frame after the renderer
       // is disposed. Resetting its buffer removes the last visible head mask.
       canvas.width = canvas.width;
@@ -784,6 +805,78 @@ export default function Home() {
       renderer?.dispose();
     };
   }, [mask, roomCode]);
+
+  useEffect(() => {
+    const canvas = faceCanvasRef.current;
+    if (!canvas || !mask.startsWith("memoji:")) return;
+    const memojiId = mask.slice("memoji:".length);
+    const indexItem = memojiMasks.find((item) => item.id === memojiId);
+    if (!indexItem) return;
+
+    let disposed = false;
+    let frameId = 0;
+    let manifest: MemojiManifest | null = null;
+    let images: HTMLImageElement[] = [];
+
+    const loadMemoji = async () => {
+      const cachedManifest = memojiManifestCacheRef.current[memojiId];
+      manifest = cachedManifest ?? await fetch(indexItem.manifest).then((response) => response.json());
+      memojiManifestCacheRef.current[memojiId] = manifest;
+      if (disposed || !manifest) return;
+
+      const basePath = indexItem.manifest.replace(/manifest\.json$/, "");
+      images = memojiFrameCacheRef.current[memojiId] ?? manifest.frames.map((frame) => {
+        const image = new Image();
+        image.decoding = "async";
+        image.src = `${basePath}${frame}`;
+        return image;
+      });
+      memojiFrameCacheRef.current[memojiId] = images;
+
+      const context = canvas.getContext("2d");
+      if (!context) return;
+
+      const render = () => {
+        if (disposed || !manifest) return;
+        const width = canvas.clientWidth;
+        const height = canvas.clientHeight;
+        const ratio = Math.min(window.devicePixelRatio, 2);
+        if (width && height && (canvas.width !== width * ratio || canvas.height !== height * ratio)) {
+          canvas.width = width * ratio;
+          canvas.height = height * ratio;
+        }
+        context.clearRect(0, 0, canvas.width, canvas.height);
+
+        const pose = facePoseRef.current;
+        if (pose && images.length > 0) {
+          const wrappedYaw = ((pose.yaw + Math.PI) / (Math.PI * 2) + 0.5) % 1;
+          const tiltOffset = Math.round((pose.roll / Math.PI) * images.length * 0.35);
+          const frameIndex = (Math.round(wrappedYaw * (images.length - 1)) + tiltOffset + images.length) % images.length;
+          const image = images[frameIndex] ?? images[0];
+          if (image.complete && image.naturalWidth) {
+            const drawWidth = Math.max(80, pose.scale * canvas.height * 0.82);
+            const drawHeight = drawWidth * (manifest.height / manifest.width);
+            const drawX = pose.x * canvas.width - drawWidth / 2;
+            const drawY = pose.y * canvas.height - drawHeight * 0.53;
+            context.save();
+            context.translate(drawX + drawWidth / 2, drawY + drawHeight / 2);
+            context.rotate(pose.roll * 0.16);
+            context.drawImage(image, -drawWidth / 2, -drawHeight / 2, drawWidth, drawHeight);
+            context.restore();
+          }
+        }
+        frameId = requestAnimationFrame(render);
+      };
+      render();
+    };
+
+    void loadMemoji();
+    return () => {
+      disposed = true;
+      cancelAnimationFrame(frameId);
+      canvas.width = canvas.width;
+    };
+  }, [mask, memojiMasks, roomCode]);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -1179,7 +1272,7 @@ export default function Home() {
               </section>}
               {gameMode === "duel" && <section className="round-stats" aria-label="本回合統計"><span>本回合</span><b>你：{roundStats.you.hits} 擊 · {roundStats.you.damage} 傷害</b><b>對手：{roundStats.friend.hits} 擊 · {roundStats.friend.damage} 傷害</b></section>}
               {comboToast && <div className="combo-toast" aria-live="assertive"><span>默契爆發</span><strong>{comboToast}</strong><small>Boss -{comboToast.includes("合體技") ? 96 : RAID_COMBO_DAMAGE}</small></div>}
-              <article className="fighter you"><video ref={videoRef} className={mirrored ? "" : "unmirrored"} autoPlay muted playsInline />{showTrackingPoints && <canvas ref={poseCanvasRef} className="pose-overlay" />}{mask !== "none" && <canvas ref={faceCanvasRef} className="three-mask-overlay" />}{showOpponentGloves && opponentHands.left && <span className="opponent-glove left" style={{ left: `${(mirrored ? 1 - opponentHands.left.x : opponentHands.left.x) * 100}%`, top: `${opponentHands.left.y * 100}%` }}>🥊</span>}{showOpponentGloves && opponentHands.right && <span className="opponent-glove right" style={{ left: `${(mirrored ? 1 - opponentHands.right.x : opponentHands.right.x) * 100}%`, top: `${opponentHands.right.y * 100}%` }}>🥊</span>}<div className="mask-picker" aria-label="選擇 3D 頭套">{([{ key: "none", emoji: "🚫" }, { key: "frog", emoji: "🐸" }, { key: "pig", emoji: "🐷" }, { key: "rabbit", emoji: "🐰" }] as const).map(({ key, emoji }) => <button key={key} className={mask === key ? "selected" : ""} onClick={() => setMask(key)} aria-label={`選擇 ${emoji} 頭套`}>{emoji}</button>)}</div><span className={`face-tracking ${faceTracked ? "active" : ""}`}>{faceTracked ? "● 3D FACE" : "○ 找不到臉部"}</span><span className={`tracking ${tracking ? "active" : ""}`}>{tracking ? "● 上半身追蹤中" : "○ 找不到上半身"}</span><span className="tag">YOU</span>{effect?.side === "left" && <div className={`attack-fx ${effect.kind} ${effect.hand} ${getAttackTrajectory(effect.kind, effect.hand)}`}><i /><i /><i /><b>{effect.kind === "straight" ? "KAPOW!" : "WHAM!"}</b></div>}{hitEffect && <div className={`damage-fx ${hitEffect}`} aria-live="polite"><i /><i /><b>{hitEffect === "block" ? "BLOCK!" : "HIT!"}</b></div>}</article>
+              <article className="fighter you"><video ref={videoRef} className={mirrored ? "" : "unmirrored"} autoPlay muted playsInline />{showTrackingPoints && <canvas ref={poseCanvasRef} className="pose-overlay" />}{mask !== "none" && <canvas ref={faceCanvasRef} className="three-mask-overlay" />}{showOpponentGloves && opponentHands.left && <span className="opponent-glove left" style={{ left: `${(mirrored ? 1 - opponentHands.left.x : opponentHands.left.x) * 100}%`, top: `${opponentHands.left.y * 100}%` }}>🥊</span>}{showOpponentGloves && opponentHands.right && <span className="opponent-glove right" style={{ left: `${(mirrored ? 1 - opponentHands.right.x : opponentHands.right.x) * 100}%`, top: `${opponentHands.right.y * 100}%` }}>🥊</span>}<div className="mask-picker" aria-label="選擇 3D 頭套">{([{ key: "none", emoji: "🚫" }, { key: "frog", emoji: "🐸" }, { key: "pig", emoji: "🐷" }, { key: "rabbit", emoji: "🐰" }] as const).map(({ key, emoji }) => <button key={key} className={mask === key ? "selected" : ""} onClick={() => setMask(key)} aria-label={`選擇 ${emoji} 頭套`}>{emoji}</button>)}{memojiMasks.map((item) => <button key={item.id} className={mask === `memoji:${item.id}` ? "selected memoji" : "memoji"} onClick={() => setMask(`memoji:${item.id}`)} aria-label={`選擇 ${item.title} Memoji 頭套`}>ME</button>)}</div><span className={`face-tracking ${faceTracked ? "active" : ""}`}>{faceTracked ? "● 3D FACE" : "○ 找不到臉部"}</span><span className={`tracking ${tracking ? "active" : ""}`}>{tracking ? "● 上半身追蹤中" : "○ 找不到上半身"}</span><span className="tag">YOU</span>{effect?.side === "left" && <div className={`attack-fx ${effect.kind} ${effect.hand} ${getAttackTrajectory(effect.kind, effect.hand)}`}><i /><i /><i /><b>{effect.kind === "straight" ? "KAPOW!" : "WHAM!"}</b></div>}{hitEffect && <div className={`damage-fx ${hitEffect}`} aria-live="polite"><i /><i /><b>{hitEffect === "block" ? "BLOCK!" : "HIT!"}</b></div>}</article>
               <article className="fighter friend"><video ref={opponentVideoRef} autoPlay playsInline />{showOpponentGloves && myHands.left && <span className="opponent-glove own-glove left" style={{ left: `${myHands.left.x * 100}%`, top: `${myHands.left.y * 100}%` }}>🥊</span>}{showOpponentGloves && myHands.right && <span className="opponent-glove own-glove right" style={{ left: `${myHands.right.x * 100}%`, top: `${myHands.right.y * 100}%` }}>🥊</span>}<span className="tag">FRIEND</span>{effect?.side === "right" && <div className={`attack-fx ${effect.kind} ${effect.hand} ${getAttackTrajectory(effect.kind, effect.hand)}`}><i /><i /><i /><b>{effect.kind === "straight" ? "KAPOW!" : "WHAM!"}</b></div>} {!connected && <div className="waiting">等待搭檔<br /><small>分享邀請連結</small></div>}</article>
             </section>
           </section>

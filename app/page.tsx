@@ -4,6 +4,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Peer, type DataConnection, type MediaConnection } from "peerjs";
 import { createMotionThresholds, getDodgeDirection, getPunchKind, isBlocking, isWristTracked, resolvePunch, type DodgeDirection, type PunchHand } from "../src/game-rules";
 import { EMPTY_ROUND_STATS, getActionFeedback, getAttackTrajectory, getRoundEndNotice, recordRoundHit, type CombatOutcome } from "../src/game-feedback";
+import { getRaidActionDamage, getRaidResult, isRaidMissionComplete, RAID_BOSS_MAX_HEALTH, RAID_MISSIONS, RAID_SECONDS, type RaidAction, type RaidActor, type RecentRaidActions } from "../src/raid-game";
+import { BOSS_ATTACKS, BOSS_HIT_IMAGE, BOSS_WINDUP_IMAGE, getBossAttackTimeline, getBossSceneImage, isBossAttackAvoided, type BossAttackKind, type BossAttackPhase } from "../src/boss-attacks";
 
 type Fighter = "left" | "right";
 type PunchKind = "straight" | "hook";
@@ -14,6 +16,7 @@ type HandPosition = { x: number; y: number };
 type HitEffect = "hit" | "block";
 type TutorialPhase = "explain" | "practice";
 type PlayerRole = "host" | "guest";
+type GameMode = "raid" | "duel";
 type Calibration = { shoulderWidth: number; thresholds: ReturnType<typeof createMotionThresholds> };
 type EventMessage =
   | { type: "punch"; kind: PunchKind; hand: PunchHand; sentAt: number }
@@ -23,10 +26,15 @@ type EventMessage =
   | { type: "handPosition"; left: HandPosition | null; right: HandPosition | null }
   | { type: "tutorialReady" }
   | { type: "ready" }
+  | { type: "mode"; mode: GameMode }
+  | { type: "raidAction"; action: RaidAction; actor: RaidActor; sentAt: number }
+  | { type: "raidState"; bossHealth: number; duoCharge: number; missionIndex: number; comboCount: number; comboTitle?: string }
+  | { type: "bossAttack"; kind: BossAttackKind; startsAt: number }
   | { type: "start"; startsAt: number };
 
 const ROUND_SECONDS = 60;
 const ROUNDS = 3;
+const RAID_COMBO_DAMAGE = 72;
 
 const TUTORIAL_STEPS = [
   { key: "straight", title: "直拳", note: "手腕快速向前伸出，手臂伸直。" },
@@ -84,7 +92,19 @@ export default function Home() {
   const retryTimerRef = useRef<number | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const audioSettingsRef = useRef({ muted: false, volume: 0.55 });
+  const isHostRef = useRef(false);
+  const gameModeRef = useRef<GameMode>("raid");
+  const bossHealthRef = useRef(RAID_BOSS_MAX_HEALTH);
+  const duoChargeRef = useRef(0);
+  const missionIndexRef = useRef(0);
+  const comboCountRef = useRef(0);
+  const comboLockRef = useRef(false);
+  const recentRaidActionsRef = useRef<RecentRaidActions>({ host: {}, guest: {} });
+  const bossAttackTimersRef = useRef<number[]>([]);
+  const bossHitTimerRef = useRef<number | null>(null);
+  const nextBossAttackRef = useRef(0);
 
+  const [gameMode, setGameMode] = useState<GameMode>("raid");
   const [roomCode, setRoomCode] = useState("");
   const [roomInput, setRoomInput] = useState("");
   const [status, setStatus] = useState("建立房間，準備上擂台");
@@ -92,7 +112,7 @@ export default function Home() {
   const [connected, setConnected] = useState(false);
   const [cameraReady, setCameraReady] = useState(false);
   const [round, setRound] = useState(1);
-  const [seconds, setSeconds] = useState(ROUND_SECONDS);
+  const [seconds, setSeconds] = useState(RAID_SECONDS);
   const [myHealth, setMyHealth] = useState(100);
   const [opponentHealth, setOpponentHealth] = useState(100);
   const [myHits, setMyHits] = useState(0);
@@ -124,12 +144,82 @@ export default function Home() {
   const [faceTracked, setFaceTracked] = useState(false);
   const [myHands, setMyHands] = useState<{ left: HandPosition | null; right: HandPosition | null }>({ left: null, right: null });
   const [opponentHands, setOpponentHands] = useState<{ left: HandPosition | null; right: HandPosition | null }>({ left: null, right: null });
+  const [bossHealth, setBossHealth] = useState(RAID_BOSS_MAX_HEALTH);
+  const [duoCharge, setDuoCharge] = useState(0);
+  const [missionIndex, setMissionIndex] = useState(0);
+  const [comboCount, setComboCount] = useState(0);
+  const [comboToast, setComboToast] = useState("");
+  const [bossAttackKind, setBossAttackKind] = useState<BossAttackKind | null>(null);
+  const [bossAttackPhase, setBossAttackPhase] = useState<BossAttackPhase>("idle");
+  const [bossAttackResult, setBossAttackResult] = useState("");
+  const [bossHitFrame, setBossHitFrame] = useState(false);
 
-  const roomLink = typeof window === "undefined" || !roomCode ? "" : `${window.location.origin}${window.location.pathname}?room=${roomCode}`;
+  const roomLink = typeof window === "undefined" || !roomCode ? "" : `${window.location.origin}${window.location.pathname}?room=${roomCode}&mode=${gameMode}`;
 
   const send = useCallback((message: EventMessage) => {
     if (connectionRef.current?.open) connectionRef.current.send(message);
   }, []);
+
+  const showBossHitReaction = useCallback(() => {
+    if (bossHitTimerRef.current !== null) window.clearTimeout(bossHitTimerRef.current);
+    setBossHitFrame(true);
+    bossHitTimerRef.current = window.setTimeout(() => {
+      setBossHitFrame(false);
+      bossHitTimerRef.current = null;
+    }, 430);
+  }, []);
+
+  const applyRaidAction = useCallback((action: RaidAction, actor: RaidActor, sentAt = Date.now()) => {
+    if (!isHostRef.current || gameModeRef.current !== "raid" || !startedRef.current) return;
+
+    recentRaidActionsRef.current[actor][action] = sentAt;
+    const actionDamage = getRaidActionDamage(action);
+    if (actionDamage > 0) showBossHitReaction();
+    let nextHealth = Math.max(0, bossHealthRef.current - actionDamage);
+    let nextCharge = Math.min(100, duoChargeRef.current + (action === "straight" || action === "hook" ? 5 : 2));
+    let nextMission = missionIndexRef.current;
+    let nextComboCount = comboCountRef.current;
+    let comboTitle: string | undefined;
+
+    if (!comboLockRef.current && isRaidMissionComplete(nextMission, recentRaidActionsRef.current, sentAt)) {
+      comboLockRef.current = true;
+      comboTitle = `${RAID_MISSIONS[nextMission].title}！`;
+      nextHealth = Math.max(0, nextHealth - RAID_COMBO_DAMAGE);
+      nextCharge = Math.min(100, nextCharge + 30);
+      nextComboCount += 1;
+      nextMission = (nextMission + 1) % RAID_MISSIONS.length;
+      recentRaidActionsRef.current = { host: {}, guest: {} };
+      window.setTimeout(() => { comboLockRef.current = false; }, 900);
+    }
+
+    if (nextCharge >= 100) {
+      comboTitle = "合體技：心跳重拳！";
+      nextHealth = Math.max(0, nextHealth - 96);
+      nextCharge = 0;
+    }
+
+    bossHealthRef.current = nextHealth;
+    duoChargeRef.current = nextCharge;
+    missionIndexRef.current = nextMission;
+    comboCountRef.current = nextComboCount;
+    setBossHealth(nextHealth);
+    setDuoCharge(nextCharge);
+    setMissionIndex(nextMission);
+    setComboCount(nextComboCount);
+    if (comboTitle) {
+      setComboToast(comboTitle);
+      window.setTimeout(() => setComboToast(""), 1300);
+    }
+    send({ type: "raidState", bossHealth: nextHealth, duoCharge: nextCharge, missionIndex: nextMission, comboCount: nextComboCount, comboTitle });
+  }, [send, showBossHitReaction]);
+
+  const announceRaidAction = useCallback((action: RaidAction) => {
+    if (gameModeRef.current !== "raid" || !startedRef.current) return;
+    if (!isHostRef.current && getRaidActionDamage(action) > 0) showBossHitReaction();
+    const actor: RaidActor = isHostRef.current ? "host" : "guest";
+    if (isHostRef.current) applyRaidAction(action, actor);
+    else send({ type: "raidAction", action, actor, sentAt: Date.now() });
+  }, [applyRaidAction, send, showBossHitReaction]);
 
   const playActionSound = useCallback((action: "straight" | "hook" | "dodge" | "block" | "hit" | "blocked") => {
     const AudioContextClass = window.AudioContext ?? (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
@@ -161,6 +251,41 @@ export default function Home() {
     window.setTimeout(() => setHitEffect(null), 450);
   }, [playActionSound]);
 
+  const playBossAttack = useCallback((kind: BossAttackKind, startsAt: number) => {
+    bossAttackTimersRef.current.forEach((timer) => window.clearTimeout(timer));
+    bossAttackTimersRef.current = [];
+    const schedule = (callback: () => void, at: number) => {
+      const timer = window.setTimeout(callback, Math.max(0, at - Date.now()));
+      bossAttackTimersRef.current.push(timer);
+    };
+
+    const timeline = getBossAttackTimeline(startsAt);
+    schedule(() => {
+      setBossAttackKind(kind);
+      setBossAttackPhase("windup");
+      setBossAttackResult("");
+      setStatus(`${BOSS_ATTACKS[kind].title}蓄力中，準備${BOSS_ATTACKS[kind].defense}！`);
+      playActionSound("block");
+    }, timeline.windupAt);
+    schedule(() => {
+      setBossAttackPhase("attack");
+      setStatus(BOSS_ATTACKS[kind].prompt);
+      playActionSound("hit");
+    }, timeline.attackAt);
+    schedule(() => {
+      const avoided = isBossAttackAvoided(kind, dodgeDirectionRef.current, blockRef.current);
+      setBossAttackResult(avoided ? "PERFECT！閃避成功" : `被${BOSS_ATTACKS[kind].title}擊中`);
+      setStatus(avoided ? `漂亮！${BOSS_ATTACKS[kind].defense}成功。` : `沒躲過！下次看到預警就做出${BOSS_ATTACKS[kind].defense}。`);
+      if (avoided) playActionSound(kind === "slam" ? "block" : "dodge");
+      else showHitEffect(false);
+    }, timeline.resolveAt);
+    schedule(() => {
+      setBossAttackPhase("idle");
+      setBossAttackKind(null);
+    }, timeline.idleAt);
+    schedule(() => setBossAttackResult(""), timeline.clearResultAt);
+  }, [playActionSound, showHitEffect]);
+
   const resetCalibration = () => {
     calibratedRef.current = false;
     calibrationRef.current = null;
@@ -174,7 +299,7 @@ export default function Home() {
   const applyAuthoritativePunch = useCallback((kind: PunchKind, hand: PunchHand, attacker: PlayerRole) => {
     // The host is the single authority. It evaluates the defender's latest
     // announced defensive state and sends one result that both clients apply.
-    if (!isHost || !startedRef.current) return;
+    if (!isHostRef.current || !startedRef.current || gameModeRef.current !== "duel") return;
     const defendingHost = attacker === "guest";
     const result = resolvePunch(kind, defendingHost ? dodgeDirectionRef.current : opponentDodgeRef.current, defendingHost ? blockRef.current : opponentBlockRef.current);
     const combat = { type: "combatResult" as const, attacker, kind, hand, outcome: result.outcome, damage: result.damage };
@@ -195,7 +320,7 @@ export default function Home() {
       setStatus(result.outcome === "evaded" ? "對手閃過了攻擊！" : result.outcome === "blocked" ? "對手格檔了攻擊。" : "命中對手！");
     }
     send(combat);
-  }, [isHost, send, showHitEffect]);
+  }, [send, showHitEffect]);
 
   function scheduleMatchStart() {
     if (countdownRef.current || startedRef.current) return;
@@ -208,12 +333,33 @@ export default function Home() {
 
   const receive = useCallback((raw: unknown) => {
     const message = raw as EventMessage;
-    if (message.type === "punch" && isHost) {
+    if (message.type === "mode") {
+      gameModeRef.current = message.mode;
+      setGameMode(message.mode);
+      if (!startedRef.current) setSeconds(message.mode === "raid" ? RAID_SECONDS : ROUND_SECONDS);
+    }
+    if (message.type === "raidAction" && isHostRef.current) applyRaidAction(message.action, "guest", message.sentAt);
+    if (message.type === "raidState" && !isHostRef.current) {
+      bossHealthRef.current = message.bossHealth;
+      duoChargeRef.current = message.duoCharge;
+      missionIndexRef.current = message.missionIndex;
+      comboCountRef.current = message.comboCount;
+      setBossHealth(message.bossHealth);
+      setDuoCharge(message.duoCharge);
+      setMissionIndex(message.missionIndex);
+      setComboCount(message.comboCount);
+      if (message.comboTitle) {
+        setComboToast(message.comboTitle);
+        window.setTimeout(() => setComboToast(""), 1300);
+      }
+    }
+    if (message.type === "bossAttack") playBossAttack(message.kind, message.startsAt);
+    if (message.type === "punch" && isHostRef.current && gameModeRef.current === "duel") {
       setEffect({ side: "right", kind: message.kind, hand: message.hand });
       window.setTimeout(() => setEffect(null), 500);
       applyAuthoritativePunch(message.kind, message.hand, "guest");
     }
-    if (message.type === "combatResult" && !isHost) {
+    if (message.type === "combatResult" && !isHostRef.current) {
       const defendingGuest = message.attacker === "host";
       if (defendingGuest) {
         setEffect({ side: "right", kind: message.kind, hand: message.hand });
@@ -243,13 +389,13 @@ export default function Home() {
     if (message.type === "tutorialReady") {
       opponentTutorialReadyRef.current = true;
       setStatus("朋友已完成教學，等待你準備。");
-      if (isHost && tutorialReadyRef.current) scheduleMatchStart();
+      if (isHostRef.current && tutorialReadyRef.current) scheduleMatchStart();
     }
     if (message.type === "start" && !startedRef.current) {
       window.setTimeout(() => startMatch(), Math.max(0, message.startsAt - Date.now()));
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [applyAuthoritativePunch, isHost, send, showHitEffect]);
+  }, [applyAuthoritativePunch, applyRaidAction, playBossAttack, send, showHitEffect]);
 
   const attachConnection = useCallback((connection: DataConnection, callbacks?: { onOpen?: () => void; onFailure?: () => void }) => {
     let opened = false;
@@ -258,6 +404,10 @@ export default function Home() {
       opened = true;
       setConnected(true);
       setStatus("朋友已進入房間，請完成動作教學");
+      if (isHostRef.current) {
+        send({ type: "mode", mode: gameModeRef.current });
+        send({ type: "raidState", bossHealth: bossHealthRef.current, duoCharge: duoChargeRef.current, missionIndex: missionIndexRef.current, comboCount: comboCountRef.current });
+      }
       callbacks?.onOpen?.();
     });
     connection.on("data", receive);
@@ -372,8 +522,19 @@ export default function Home() {
 
   const createRoom = async () => {
     const code = makeRoomCode();
+    isHostRef.current = true;
+    bossHealthRef.current = RAID_BOSS_MAX_HEALTH;
+    duoChargeRef.current = 0;
+    missionIndexRef.current = 0;
+    comboCountRef.current = 0;
+    recentRaidActionsRef.current = { host: {}, guest: {} };
+    setBossHealth(RAID_BOSS_MAX_HEALTH);
+    setDuoCharge(0);
+    setMissionIndex(0);
+    setComboCount(0);
     setRoomCode(code);
     setIsHost(true);
+    setSeconds(gameModeRef.current === "raid" ? RAID_SECONDS : ROUND_SECONDS);
     setHostPeerReady(false);
     resetCalibration();
     await activateCamera();
@@ -383,8 +544,10 @@ export default function Home() {
   const joinRoom = async () => {
     const code = roomInput.trim().toUpperCase();
     if (!code) return setStatus("請輸入朋友分享的房間碼。");
+    isHostRef.current = false;
     setRoomCode(code);
     setIsHost(false);
+    setSeconds(gameModeRef.current === "raid" ? RAID_SECONDS : ROUND_SECONDS);
     resetCalibration();
     await activateCamera();
     joinPeer(code, false);
@@ -393,9 +556,9 @@ export default function Home() {
   const startMatch = (roundNumber = round) => {
     startedRef.current = true;
     setStarted(true);
-    setMatchNotice({ title: `ROUND ${roundNumber}`, detail: "FIGHT!" });
+    setMatchNotice(gameModeRef.current === "raid" ? { title: "今日討伐", detail: "一起打倒棉花糖拳王！" } : { title: `ROUND ${roundNumber}`, detail: "FIGHT!" });
     window.setTimeout(() => setMatchNotice(null), 1100);
-    setStatus(`第 ${roundNumber} 回合開始！出拳、勾拳或閃躲。`);
+    setStatus(gameModeRef.current === "raid" ? "討伐開始！出拳累積默契能量，完成任務觸發合體技。" : `第 ${roundNumber} 回合開始！出拳、勾拳或閃躲。`);
   };
 
   const finishTutorial = () => {
@@ -403,7 +566,7 @@ export default function Home() {
     setTutorialComplete(true);
     send({ type: "tutorialReady" });
     setStatus("你已準備完成，等待朋友。 ");
-    if (isHost && opponentTutorialReadyRef.current) scheduleMatchStart();
+    if (isHostRef.current && opponentTutorialReadyRef.current) scheduleMatchStart();
   };
 
   const startTutorialPractice = () => {
@@ -435,7 +598,7 @@ export default function Home() {
         setTutorialComplete(true);
         send({ type: "tutorialReady" });
         setStatus("你已完成教學，等待朋友。 ");
-        if (isHost && opponentTutorialReadyRef.current) scheduleMatchStart();
+        if (isHostRef.current && opponentTutorialReadyRef.current) scheduleMatchStart();
         return;
       }
       tutorialStepRef.current = step + 1;
@@ -443,7 +606,7 @@ export default function Home() {
       setTutorialStep(step + 1);
       setTutorialPracticeCount(0);
     }, 650);
-  }, [isHost, send, tutorialComplete]);
+  }, [send, tutorialComplete]);
 
   const announcePunch = useCallback((kind: PunchKind, hand: PunchHand) => {
     setEffect({ side: "left", kind, hand });
@@ -452,11 +615,12 @@ export default function Home() {
     // Preview effects work before the match starts; damage is only shared in a live round.
     if (startedRef.current) {
       playActionSound(kind);
-      if (isHost) applyAuthoritativePunch(kind, hand, "host");
+      if (gameModeRef.current === "raid") announceRaidAction(kind);
+      else if (isHostRef.current) applyAuthoritativePunch(kind, hand, "host");
       else send({ type: "punch", kind, hand, sentAt: Date.now() });
     }
     window.setTimeout(() => setEffect(null), 500);
-  }, [applyAuthoritativePunch, isHost, playActionSound, send, registerTutorialMove]);
+  }, [announceRaidAction, applyAuthoritativePunch, playActionSound, send, registerTutorialMove]);
 
   const drawPose = useCallback((points: Array<{ x: number; y: number; visibility?: number }>) => {
     const canvas = poseCanvasRef.current;
@@ -622,18 +786,62 @@ export default function Home() {
   }, [mask, roomCode]);
 
   useEffect(() => {
-    const fromUrl = new URLSearchParams(window.location.search).get("room");
+    const params = new URLSearchParams(window.location.search);
+    const fromUrl = params.get("room");
+    const sharedMode = params.get("mode");
     if (fromUrl) setRoomInput(fromUrl.toUpperCase());
+    if (sharedMode === "raid" || sharedMode === "duel") {
+      gameModeRef.current = sharedMode;
+      setGameMode(sharedMode);
+      setSeconds(sharedMode === "raid" ? RAID_SECONDS : ROUND_SECONDS);
+    }
   }, []);
 
   useEffect(() => {
-    if (!started || seconds <= 0 || myHealth === 0 || opponentHealth === 0) return;
-    const timer = window.setInterval(() => setSeconds((value) => value - 1), 1000);
-    return () => window.clearInterval(timer);
-  }, [started, seconds, myHealth, opponentHealth]);
+    [BOSS_WINDUP_IMAGE, BOSS_HIT_IMAGE, ...Object.values(BOSS_ATTACKS).map((attack) => attack.image)].forEach((src) => {
+      const image = new Image();
+      image.src = src;
+    });
+  }, []);
 
   useEffect(() => {
-    if (!started || (seconds > 0 && myHealth > 0 && opponentHealth > 0)) return;
+    if (!started || gameMode !== "raid" || !isHostRef.current) return;
+    let scheduleTimer: number | null = null;
+    const attacks: BossAttackKind[] = ["straight", "sweep", "slam"];
+    const queueAttack = () => {
+      scheduleTimer = window.setTimeout(() => {
+        const kind = attacks[nextBossAttackRef.current % attacks.length];
+        nextBossAttackRef.current += 1;
+        const startsAt = Date.now() + 350;
+        send({ type: "bossAttack", kind, startsAt });
+        playBossAttack(kind, startsAt);
+        queueAttack();
+      }, 5200 + Math.round(Math.random() * 1800));
+    };
+    queueAttack();
+    return () => {
+      if (scheduleTimer !== null) window.clearTimeout(scheduleTimer);
+    };
+  }, [gameMode, playBossAttack, send, started]);
+
+  useEffect(() => {
+    if (!started || seconds <= 0 || (gameMode === "duel" && (myHealth === 0 || opponentHealth === 0)) || (gameMode === "raid" && bossHealth === 0)) return;
+    const timer = window.setInterval(() => setSeconds((value) => value - 1), 1000);
+    return () => window.clearInterval(timer);
+  }, [started, seconds, myHealth, opponentHealth, gameMode, bossHealth]);
+
+  useEffect(() => {
+    if (!started) return;
+    if (gameMode === "raid") {
+      if (seconds > 0 && bossHealth > 0) return;
+      startedRef.current = false;
+      setStarted(false);
+      const result = getRaidResult(bossHealth, seconds);
+      setGameMessage(result.title);
+      setMatchNotice({ title: result.title, detail: `${result.detail} · 合體技 ${comboCount} 次` });
+      return;
+    }
+    if (seconds > 0 && myHealth > 0 && opponentHealth > 0) return;
     startedRef.current = false;
     setStarted(false);
     const notice = getRoundEndNotice({ round, rounds: ROUNDS, myHealth, opponentHealth, stats: roundStats, totalMyHits: myHits, totalOpponentHits: opponentHits });
@@ -652,7 +860,7 @@ export default function Home() {
       setGameMessage(notice.title);
       setMatchNotice(notice);
     }
-  }, [started, seconds, myHealth, opponentHealth, round, myHits, opponentHits, roundStats]);
+  }, [started, seconds, myHealth, opponentHealth, round, myHits, opponentHits, roundStats, gameMode, bossHealth, comboCount]);
 
   useEffect(() => {
     let cancelled = false;
@@ -793,6 +1001,7 @@ export default function Home() {
                 setLastMove(`偵測到${dodgeDirection}閃躲！`);
                 playActionSound("dodge");
                 registerTutorialMove(dodgeDirection === "下蹲" ? "duck" : "side");
+                if (dodgeDirection === "下蹲") announceRaidAction("duck");
               }
             }
             if (!dodging) dodgeDirectionRef.current = null;
@@ -811,6 +1020,7 @@ export default function Home() {
                 setLastMove("偵測到格檔！受到傷害降低 80%");
                 playActionSound("block");
                 registerTutorialMove("block");
+                announceRaidAction("block");
               }
             }
             ([{ key: "left", wrist: points[15], elbow: points[13], shoulder: points[11], visible: leftWristVisible }, { key: "right", wrist: points[16], elbow: points[14], shoulder: points[12], visible: rightWristVisible }] as const).forEach(({ key, wrist, elbow, shoulder, visible }) => {
@@ -844,11 +1054,13 @@ export default function Home() {
     };
     if (cameraReady) runDetection().catch(() => setStatus("動作辨識載入失敗，但視訊連線仍可使用。"));
     return () => { cancelled = true; if (animationRef.current) cancelAnimationFrame(animationRef.current); };
-  }, [cameraReady, announcePunch, send, drawPose, playActionSound, registerTutorialMove]);
+  }, [cameraReady, announcePunch, announceRaidAction, send, drawPose, playActionSound, registerTutorialMove]);
 
   useEffect(() => () => {
     if (retryTimerRef.current !== null) window.clearTimeout(retryTimerRef.current);
     if (tutorialAdvanceTimerRef.current !== null) window.clearTimeout(tutorialAdvanceTimerRef.current);
+    if (bossHitTimerRef.current !== null) window.clearTimeout(bossHitTimerRef.current);
+    bossAttackTimersRef.current.forEach((timer) => window.clearTimeout(timer));
     if (compositeFrameRef.current !== null) cancelAnimationFrame(compositeFrameRef.current);
     peerRef.current?.destroy();
     outboundStreamRef.current?.getTracks().forEach((track) => track.stop());
@@ -857,15 +1069,59 @@ export default function Home() {
   }, []);
 
   const lesson = TUTORIAL_STEPS[tutorialStep];
+  const raidMission = RAID_MISSIONS[missionIndex];
+  const bossSceneImage = getBossSceneImage(bossAttackPhase, bossAttackKind, bossHitFrame);
+
+  const chooseMode = (mode: GameMode) => {
+    gameModeRef.current = mode;
+    setGameMode(mode);
+    setSeconds(mode === "raid" ? RAID_SECONDS : ROUND_SECONDS);
+    setStatus(mode === "raid" ? "建立房間，邀請你的搭檔一起打怪" : "建立房間，準備上擂台");
+  };
+
+  const downloadResultPoster = () => {
+    const canvas = document.createElement("canvas");
+    canvas.width = 1080;
+    canvas.height = 1350;
+    const context = canvas.getContext("2d");
+    if (!context) return;
+    const hero = new Image();
+    hero.onload = () => {
+      context.fillStyle = "#fffaf2";
+      context.fillRect(0, 0, canvas.width, canvas.height);
+      context.drawImage(hero, 0, 0, hero.width, hero.height, 0, 0, 1080, 720);
+      context.fillStyle = "#17211f";
+      context.fillRect(0, 700, 1080, 650);
+      context.fillStyle = "#ff6f61";
+      context.font = "900 40px Arial";
+      context.fillText("PUNCHCAM · COUPLE RAID", 70, 790);
+      context.fillStyle = "#fffaf2";
+      context.font = "900 92px Arial";
+      context.fillText(bossHealth <= 0 ? "討伐成功！" : "今日挑戰完成", 70, 915);
+      context.fillStyle = "#ffd45a";
+      context.font = "700 42px Arial";
+      context.fillText(`默契 Combo ${comboCount} 次`, 70, 1010);
+      context.fillStyle = "#7ee0cf";
+      context.fillText(`共同傷害 ${RAID_BOSS_MAX_HEALTH - bossHealth}`, 70, 1075);
+      context.fillStyle = "#d8e2df";
+      context.font = "32px Arial";
+      context.fillText("今天也一起動了 3 分鐘。", 70, 1195);
+      const link = document.createElement("a");
+      link.download = `punchcam-raid-${new Date().toISOString().slice(0, 10)}.png`;
+      link.href = canvas.toDataURL("image/png");
+      link.click();
+    };
+    hero.src = "/assets/couple-raid-hero.png";
+  };
 
   return (
     <main>
       <section className="arena-shell">
         <header>
-          <div className="brand"><span>✦</span> PUNCH//CAM</div>
-          {roomCode && <div className="header-room"><div><label>ROOM CODE</label><b>{roomCode}</b></div>{isHost && <button className="copy" disabled={!hostPeerReady} onClick={() => navigator.clipboard.writeText(roomLink)}>{hostPeerReady ? "複製邀請連結" : "正在建立房間…"}</button>}<p title={gameMessage || status}>{gameMessage || status} <span className="move-readout">{visibleWrists === 0 ? "手腕未入鏡：僅可閃躲" : lastMove}</span></p></div>}
-          <div className="round-pill">ROUND {round} <b>{String(seconds).padStart(2, "0")}</b></div>
-          <div className="header-actions"><button className="settings-button" onClick={() => setSettingsOpen((open) => !open)} aria-expanded={settingsOpen}>⚙ 設定</button><div className={`connection ${connected ? "online" : ""}`}>{connected ? "● LIVE" : "○ WAITING"}</div></div>
+          <div className="brand"><span>✦</span> PUNCHCAM</div>
+          {roomCode && <div className="header-room"><div><label>ROOM CODE</label><b>{roomCode}</b></div>{isHost && <button className="copy" disabled={!hostPeerReady} onClick={() => navigator.clipboard.writeText(roomLink)}><span className="copy-long">{hostPeerReady ? "複製邀請連結" : "正在建立房間…"}</span><span className="copy-short">{hostPeerReady ? "邀請" : "準備中"}</span></button>}<p title={gameMessage || status}>{gameMessage || status} <span className="move-readout">{visibleWrists === 0 ? "手腕未入鏡：僅可閃躲" : lastMove}</span></p></div>}
+          <div className="round-pill">{gameMode === "raid" ? "RAID" : `ROUND ${round}`} <b>{Math.floor(seconds / 60)}:{String(seconds % 60).padStart(2, "0")}</b></div>
+          <div className="header-actions"><button className="settings-button" onClick={() => setSettingsOpen((open) => !open)} aria-expanded={settingsOpen} aria-label="設定">⚙ <span>設定</span></button><div className={`connection ${connected ? "online" : ""}`}>{connected ? "● LIVE" : "○ WAITING"}</div></div>
         </header>
 
         {settingsOpen && <aside className="settings-panel" aria-label="遊戲設定"><div><label>音量 {muted ? "（靜音）" : `${volume}%`}</label><input type="range" min="0" max="100" value={volume} onChange={(event) => { const next = Number(event.target.value); setVolume(next); audioSettingsRef.current.volume = next / 100; }} /></div><label><input type="checkbox" checked={muted} onChange={(event) => { setMuted(event.target.checked); audioSettingsRef.current.muted = event.target.checked; }} /> 靜音音效</label><label><input type="checkbox" checked={mirrored} onChange={(event) => setMirrored(event.target.checked)} /> 鏡像我的畫面</label><label><input type="checkbox" checked={showTrackingPoints} onChange={(event) => setShowTrackingPoints(event.target.checked)} /> 顯示追蹤點</label><label><input type="checkbox" checked={showOpponentGloves} onChange={(event) => setShowOpponentGloves(event.target.checked)} /> 顯示對手拳套</label></aside>}
@@ -882,27 +1138,52 @@ export default function Home() {
           <div className="tutorial-actions">{tutorialPhase === "explain" && <button className="tutorial-next" onClick={startTutorialPractice}>開始練習 →</button>}<button className="tutorial-skip" onClick={finishTutorial}>跳過全部教學</button></div>
         </section>}
 
-        {!roomCode ? <section className="lobby">
-          <p className="eyebrow">WEBCAM BOXING ARENA</p>
-          <h1>用你的拳頭<br /><em>上擂台。</em></h1>
-          <p className="intro">開鏡頭、分享一個連結，和朋友來場即時拳擊對決。</p>
-          <button className="primary" onClick={createRoom}>建立拳擊房間 <span>↗</span></button>
-          <div className="join-row"><input value={roomInput} onChange={(event) => setRoomInput(event.target.value)} maxLength={5} placeholder="輸入房間碼" aria-label="房間碼" /><button onClick={joinRoom}>加入</button></div>
-          <div className="moves"><span>直拳</span><span>勾拳</span><span>閃躲</span></div>
+        {!roomCode ? <section className="lobby home-lobby">
+          <div className="lobby-copy">
+            <p className="eyebrow">每天三分鐘，一起打怪流汗</p>
+            <h1>用你的拳頭，<br /><em>一起打怪。</em></h1>
+            <p className="intro">不用手把，開啟鏡頭就能和喜歡的人並肩出拳。完成默契任務，發動你們的合體技。</p>
+            <div className="mode-tabs" role="tablist" aria-label="遊戲模式">
+              <button className={gameMode === "raid" ? "selected" : ""} onClick={() => chooseMode("raid")} role="tab" aria-selected={gameMode === "raid"}><span>今日推薦</span><b>雙人討伐</b><small>合作打 Boss · 3 分鐘</small></button>
+              <button className={gameMode === "duel" ? "selected" : ""} onClick={() => chooseMode("duel")} role="tab" aria-selected={gameMode === "duel"}><span>經典模式</span><b>拳擊對決</b><small>好友競技 · 三回合</small></button>
+            </div>
+            <button className="primary" onClick={createRoom}>{gameMode === "raid" ? "建立雙人討伐房間" : "建立拳擊房間"} <span>↗</span></button>
+            <div className="join-row"><input value={roomInput} onChange={(event) => setRoomInput(event.target.value)} maxLength={5} placeholder="輸入搭檔房間碼" aria-label="房間碼" /><button onClick={joinRoom}>加入</button></div>
+            <div className="daily-streak"><strong>7</strong><span>本週一起運動<br /><b>連續 3 天</b></span><i aria-hidden="true">✓</i></div>
+          </div>
+          <div className="lobby-art" aria-label="今日 Boss 棉花糖拳王">
+            <img src="/assets/couple-raid-hero.png" alt="兩位玩家合作挑戰可愛的棉花糖拳王" />
+            <div className="boss-ribbon"><span>今日 Boss</span><strong>棉花糖拳王</strong><small>推薦動作：直拳 × 下蹲</small></div>
+          </div>
         </section> : <>
-          <section className="game-stage">
-            <section className="video-grid">
-              <section className="scoreboard">
+          <section className={`game-stage ${gameMode === "raid" ? "raid-stage" : ""}`}>
+            <section className={`video-grid ${gameMode === "raid" ? "raid-video-grid" : ""}`}>
+              {gameMode === "raid" && <div className={`raid-world phase-${bossAttackPhase} ${bossAttackKind ? `attack-${bossAttackKind}` : ""} ${bossHitFrame ? "boss-hit" : ""} ${bossHealth === 0 ? "boss-defeated" : ""}`} aria-label="棉花糖拳王戰鬥場景">
+                <img key={bossSceneImage} src={bossSceneImage} alt="棉花糖拳王站在天空競技場中央" />
+                {bossAttackPhase === "idle" && <div className="boss-focus" aria-hidden="true"><i /><i /><i /></div>}
+                {bossAttackPhase === "windup" && bossAttackKind && <div className={`boss-warning ${bossAttackKind}`} aria-live="assertive"><span>危險！{BOSS_ATTACKS[bossAttackKind].title}</span><strong>{BOSS_ATTACKS[bossAttackKind].prompt}</strong><b>{BOSS_ATTACKS[bossAttackKind].defense}</b></div>}
+                {bossAttackPhase === "attack" && bossAttackKind && <div className={`boss-attack-fx ${bossAttackKind}`} aria-hidden="true"><i /><i /><i /></div>}
+                {bossAttackResult && <div className={`boss-defense-result ${bossAttackResult.startsWith("PERFECT") ? "success" : "failed"}`} aria-live="assertive">{bossAttackResult}</div>}
+                <div className="team-damage"><span>TEAM DAMAGE</span><strong>{RAID_BOSS_MAX_HEALTH - bossHealth}</strong></div>
+              </div>}
+              {gameMode === "raid" ? <section className="raid-hud" aria-label="雙人討伐狀態">
+                <div className="boss-avatar"><img src="/assets/couple-raid-hero.png" alt="" /></div>
+                <div className="boss-status"><div><span>今日 Boss</span><strong>棉花糖拳王</strong><b>{bossHealth} / {RAID_BOSS_MAX_HEALTH}</b></div><div className="boss-health"><i style={{ width: `${(bossHealth / RAID_BOSS_MAX_HEALTH) * 100}%` }} /></div></div>
+                <div className="combo-count"><span>COMBO</span><strong>{comboCount}</strong></div>
+                <div className="raid-mission"><span>默契任務 · {raidMission.title}</span><strong>{raidMission.prompt}</strong></div>
+                <div className="duo-meter"><span>合體技</span><div><i style={{ width: `${duoCharge}%` }} /></div><b>{duoCharge}%</b></div>
+              </section> : <section className="scoreboard">
                 <div><label>FRIEND</label><strong>{opponentHealth}</strong><div className="health"><i style={{ width: `${opponentHealth}%` }} /></div><small>{opponentHits} HITS</small></div>
                 <div className="vs">VS</div>
                 <div className="opponent"><label>YOU</label><strong>{myHealth}</strong><div className="health"><i style={{ width: `${myHealth}%` }} /></div><small>{myHits} HITS</small></div>
-              </section>
-              <section className="round-stats" aria-label="本回合統計"><span>本回合</span><b>你：{roundStats.you.hits} 擊 · {roundStats.you.damage} 傷害</b><b>對手：{roundStats.friend.hits} 擊 · {roundStats.friend.damage} 傷害</b></section>
+              </section>}
+              {gameMode === "duel" && <section className="round-stats" aria-label="本回合統計"><span>本回合</span><b>你：{roundStats.you.hits} 擊 · {roundStats.you.damage} 傷害</b><b>對手：{roundStats.friend.hits} 擊 · {roundStats.friend.damage} 傷害</b></section>}
+              {comboToast && <div className="combo-toast" aria-live="assertive"><span>默契爆發</span><strong>{comboToast}</strong><small>Boss -{comboToast.includes("合體技") ? 96 : RAID_COMBO_DAMAGE}</small></div>}
               <article className="fighter you"><video ref={videoRef} className={mirrored ? "" : "unmirrored"} autoPlay muted playsInline />{showTrackingPoints && <canvas ref={poseCanvasRef} className="pose-overlay" />}{mask !== "none" && <canvas ref={faceCanvasRef} className="three-mask-overlay" />}{showOpponentGloves && opponentHands.left && <span className="opponent-glove left" style={{ left: `${(mirrored ? 1 - opponentHands.left.x : opponentHands.left.x) * 100}%`, top: `${opponentHands.left.y * 100}%` }}>🥊</span>}{showOpponentGloves && opponentHands.right && <span className="opponent-glove right" style={{ left: `${(mirrored ? 1 - opponentHands.right.x : opponentHands.right.x) * 100}%`, top: `${opponentHands.right.y * 100}%` }}>🥊</span>}<div className="mask-picker" aria-label="選擇 3D 頭套">{([{ key: "none", emoji: "🚫" }, { key: "frog", emoji: "🐸" }, { key: "pig", emoji: "🐷" }, { key: "rabbit", emoji: "🐰" }] as const).map(({ key, emoji }) => <button key={key} className={mask === key ? "selected" : ""} onClick={() => setMask(key)} aria-label={`選擇 ${emoji} 頭套`}>{emoji}</button>)}</div><span className={`face-tracking ${faceTracked ? "active" : ""}`}>{faceTracked ? "● 3D FACE" : "○ 找不到臉部"}</span><span className={`tracking ${tracking ? "active" : ""}`}>{tracking ? "● 上半身追蹤中" : "○ 找不到上半身"}</span><span className="tag">YOU</span>{effect?.side === "left" && <div className={`attack-fx ${effect.kind} ${effect.hand} ${getAttackTrajectory(effect.kind, effect.hand)}`}><i /><i /><i /><b>{effect.kind === "straight" ? "KAPOW!" : "WHAM!"}</b></div>}{hitEffect && <div className={`damage-fx ${hitEffect}`} aria-live="polite"><i /><i /><b>{hitEffect === "block" ? "BLOCK!" : "HIT!"}</b></div>}</article>
-              <article className="fighter friend"><video ref={opponentVideoRef} autoPlay playsInline />{showOpponentGloves && myHands.left && <span className="opponent-glove own-glove left" style={{ left: `${myHands.left.x * 100}%`, top: `${myHands.left.y * 100}%` }}>🥊</span>}{showOpponentGloves && myHands.right && <span className="opponent-glove own-glove right" style={{ left: `${myHands.right.x * 100}%`, top: `${myHands.right.y * 100}%` }}>🥊</span>}<span className="tag">FRIEND</span>{effect?.side === "right" && <div className={`attack-fx ${effect.kind} ${effect.hand} ${getAttackTrajectory(effect.kind, effect.hand)}`}><i /><i /><i /><b>{effect.kind === "straight" ? "KAPOW!" : "WHAM!"}</b></div>} {!connected && <div className="waiting">等待對手<br /><small>分享右側連結</small></div>}</article>
+              <article className="fighter friend"><video ref={opponentVideoRef} autoPlay playsInline />{showOpponentGloves && myHands.left && <span className="opponent-glove own-glove left" style={{ left: `${myHands.left.x * 100}%`, top: `${myHands.left.y * 100}%` }}>🥊</span>}{showOpponentGloves && myHands.right && <span className="opponent-glove own-glove right" style={{ left: `${myHands.right.x * 100}%`, top: `${myHands.right.y * 100}%` }}>🥊</span>}<span className="tag">FRIEND</span>{effect?.side === "right" && <div className={`attack-fx ${effect.kind} ${effect.hand} ${getAttackTrajectory(effect.kind, effect.hand)}`}><i /><i /><i /><b>{effect.kind === "straight" ? "KAPOW!" : "WHAM!"}</b></div>} {!connected && <div className="waiting">等待搭檔<br /><small>分享邀請連結</small></div>}</article>
             </section>
           </section>
-          {matchNotice && <section className="match-notice" aria-live="assertive"><strong>{matchNotice.title}</strong><span>{matchNotice.detail}</span></section>}
+          {matchNotice && <section className={`match-notice ${gameMessage ? "result-notice" : ""}`} aria-live="assertive"><strong>{matchNotice.title}</strong><span>{matchNotice.detail}</span>{gameMessage && gameMode === "raid" && <button onClick={downloadResultPoster}>下載今日戰果卡</button>}</section>}
         </>}
       </section>
     </main>

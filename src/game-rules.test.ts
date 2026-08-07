@@ -8,8 +8,8 @@ describe("game movement rules", () => {
   });
 
   it("classifies straight punches, hooks, and motion below the threshold", () => {
-    expect(getPunchKind({ speed: 0.003, shoulder: { x: 0.5, y: 0.5 }, elbow: { x: 0.6, y: 0.5 }, wrist: { x: 0.75, y: 0.5 } })).toBe("straight");
-    expect(getPunchKind({ speed: 0.003, shoulder: { x: 0.5, y: 0.5 }, elbow: { x: 0.7, y: 0.5 }, wrist: { x: 0.62, y: 0.65 } })).toBe("hook");
+    expect(getPunchKind({ speed: 0.003, shoulder: { x: 0.5, y: 0.5 }, elbow: { x: 0.5, y: 0.4 }, wrist: { x: 0.5, y: 0.2 } })).toBe("straight");
+    expect(getPunchKind({ speed: 0.003, hand: "right", bodyCenterX: 0.5, shoulder: { x: 0.35, y: 0.5 }, elbow: { x: 0.45, y: 0.5 }, wrist: { x: 0.62, y: 0.65 } })).toBe("hook");
     expect(getPunchKind({ speed: 0.0018, shoulder: { x: 0.5, y: 0.5 }, elbow: { x: 0.6, y: 0.5 }, wrist: { x: 0.75, y: 0.5 } })).toBeNull();
   });
 
@@ -17,6 +17,12 @@ describe("game movement rules", () => {
     // Real sample from the calibration tool: t=2089 ms in the supplied
     // right-hand straight-punch recording.
     expect(getPunchKind({ speed: 0.0085, shoulder: { x: 0.4133, y: 0.7212 }, elbow: { x: 0.3013, y: 0.7388 }, wrist: { x: 0.3979, y: 0.348 } })).toBe("straight");
+    expect(getPunchKind({ speed: 0.004, shoulder: { x: 0.5, y: 0.5 }, elbow: { x: 0.58, y: 0.42 }, wrist: { x: 0.7, y: 0.28 } })).toBe("straight");
+  });
+
+  it("keeps laterally travelling extended strikes as hooks", () => {
+    expect(getPunchKind({ speed: 0.004, hand: "right", bodyCenterX: 0.5, shoulder: { x: 0.35, y: 0.5 }, elbow: { x: 0.42, y: 0.5 }, wrist: { x: 0.84, y: 0.7 } })).toBe("hook");
+    expect(getPunchKind({ speed: 0.004, hand: "right", bodyCenterX: 0.5, shoulder: { x: 0.35, y: 0.5 }, elbow: { x: 0.42, y: 0.5 }, wrist: { x: 0.49, y: 0.55 } })).toBeNull();
   });
 
   it("detects side steps and ducks", () => {

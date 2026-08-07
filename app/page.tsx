@@ -122,6 +122,7 @@ export default function Home() {
   const [showTrackingPoints, setShowTrackingPoints] = useState(true);
   const [showOpponentGloves, setShowOpponentGloves] = useState(true);
   const [faceTracked, setFaceTracked] = useState(false);
+  const [myHands, setMyHands] = useState<{ left: HandPosition | null; right: HandPosition | null }>({ left: null, right: null });
   const [opponentHands, setOpponentHands] = useState<{ left: HandPosition | null; right: HandPosition | null }>({ left: null, right: null });
 
   const roomLink = typeof window === "undefined" || !roomCode ? "" : `${window.location.origin}${window.location.pathname}?room=${roomCode}`;
@@ -759,10 +760,14 @@ export default function Home() {
             const wristsInFrame = Number(leftWristVisible) + Number(rightWristVisible);
             setVisibleWrists((value) => value === wristsInFrame ? value : wristsInFrame);
             if (now - lastHandSendRef.current > 80) {
-              send({
-                type: "handPosition",
+              const hands = {
                 left: leftWristVisible ? { x: points[15].x, y: points[15].y } : null,
                 right: rightWristVisible ? { x: points[16].x, y: points[16].y } : null,
+              };
+              setMyHands(hands);
+              send({
+                type: "handPosition",
+                ...hands,
               });
               lastHandSendRef.current = now;
             }
@@ -811,7 +816,7 @@ export default function Home() {
             ([{ key: "left", wrist: points[15], elbow: points[13], shoulder: points[11], visible: leftWristVisible }, { key: "right", wrist: points[16], elbow: points[14], shoulder: points[12], visible: rightWristVisible }] as const).forEach(({ key, wrist, elbow, shoulder, visible }) => {
               const previous = lastWristRef.current[key];
               const speed = previous ? Math.hypot(wrist.x - previous.x, wrist.y - previous.y) / Math.max(1, now - lastWristRef.current.at) : 0;
-              const punchKind = getPunchKind({ speed, wrist, elbow, shoulder, thresholds: calibrationRef.current?.thresholds });
+              const punchKind = getPunchKind({ speed, wrist, elbow, shoulder, hand: key, bodyCenterX: shoulderCenter, thresholds: calibrationRef.current?.thresholds });
               // A hand must be confidently visible to attack. When neither wrist is
               // visible, only the head-and-shoulder dodge rule remains active.
               if (visible && !dodging && !blocking && now > cooldownRef.current[key] && punchKind) {
@@ -893,8 +898,8 @@ export default function Home() {
                 <div className="opponent"><label>YOU</label><strong>{myHealth}</strong><div className="health"><i style={{ width: `${myHealth}%` }} /></div><small>{myHits} HITS</small></div>
               </section>
               <section className="round-stats" aria-label="本回合統計"><span>本回合</span><b>你：{roundStats.you.hits} 擊 · {roundStats.you.damage} 傷害</b><b>對手：{roundStats.friend.hits} 擊 · {roundStats.friend.damage} 傷害</b></section>
-              <article className="fighter you"><video ref={videoRef} className={mirrored ? "" : "unmirrored"} autoPlay muted playsInline />{showTrackingPoints && <canvas ref={poseCanvasRef} className="pose-overlay" />}{mask !== "none" && <canvas ref={faceCanvasRef} className="three-mask-overlay" />}<div className="mask-picker" aria-label="選擇 3D 頭套">{([{ key: "none", emoji: "🚫" }, { key: "frog", emoji: "🐸" }, { key: "pig", emoji: "🐷" }, { key: "rabbit", emoji: "🐰" }] as const).map(({ key, emoji }) => <button key={key} className={mask === key ? "selected" : ""} onClick={() => setMask(key)} aria-label={`選擇 ${emoji} 頭套`}>{emoji}</button>)}</div><span className={`face-tracking ${faceTracked ? "active" : ""}`}>{faceTracked ? "● 3D FACE" : "○ 找不到臉部"}</span><span className={`tracking ${tracking ? "active" : ""}`}>{tracking ? "● 上半身追蹤中" : "○ 找不到上半身"}</span><span className="tag">YOU</span>{effect?.side === "left" && <div className={`attack-fx ${effect.kind} ${effect.hand} ${getAttackTrajectory(effect.kind, effect.hand)}`}><i /><i /><i /><b>{effect.kind === "straight" ? "KAPOW!" : "WHAM!"}</b></div>}{hitEffect && <div className={`damage-fx ${hitEffect}`} aria-live="polite"><i /><i /><b>{hitEffect === "block" ? "BLOCK!" : "HIT!"}</b></div>}</article>
-              <article className="fighter friend"><video ref={opponentVideoRef} autoPlay playsInline />{showOpponentGloves && opponentHands.left && <span className="opponent-glove left" style={{ left: `${opponentHands.left.x * 100}%`, top: `${opponentHands.left.y * 100}%` }}>🥊</span>}{showOpponentGloves && opponentHands.right && <span className="opponent-glove right" style={{ left: `${opponentHands.right.x * 100}%`, top: `${opponentHands.right.y * 100}%` }}>🥊</span>}<span className="tag">FRIEND</span>{effect?.side === "right" && <div className={`attack-fx ${effect.kind} ${effect.hand} ${getAttackTrajectory(effect.kind, effect.hand)}`}><i /><i /><i /><b>{effect.kind === "straight" ? "KAPOW!" : "WHAM!"}</b></div>} {!connected && <div className="waiting">等待對手<br /><small>分享右側連結</small></div>}</article>
+              <article className="fighter you"><video ref={videoRef} className={mirrored ? "" : "unmirrored"} autoPlay muted playsInline />{showTrackingPoints && <canvas ref={poseCanvasRef} className="pose-overlay" />}{mask !== "none" && <canvas ref={faceCanvasRef} className="three-mask-overlay" />}{showOpponentGloves && opponentHands.left && <span className="opponent-glove left" style={{ left: `${(mirrored ? 1 - opponentHands.left.x : opponentHands.left.x) * 100}%`, top: `${opponentHands.left.y * 100}%` }}>🥊</span>}{showOpponentGloves && opponentHands.right && <span className="opponent-glove right" style={{ left: `${(mirrored ? 1 - opponentHands.right.x : opponentHands.right.x) * 100}%`, top: `${opponentHands.right.y * 100}%` }}>🥊</span>}<div className="mask-picker" aria-label="選擇 3D 頭套">{([{ key: "none", emoji: "🚫" }, { key: "frog", emoji: "🐸" }, { key: "pig", emoji: "🐷" }, { key: "rabbit", emoji: "🐰" }] as const).map(({ key, emoji }) => <button key={key} className={mask === key ? "selected" : ""} onClick={() => setMask(key)} aria-label={`選擇 ${emoji} 頭套`}>{emoji}</button>)}</div><span className={`face-tracking ${faceTracked ? "active" : ""}`}>{faceTracked ? "● 3D FACE" : "○ 找不到臉部"}</span><span className={`tracking ${tracking ? "active" : ""}`}>{tracking ? "● 上半身追蹤中" : "○ 找不到上半身"}</span><span className="tag">YOU</span>{effect?.side === "left" && <div className={`attack-fx ${effect.kind} ${effect.hand} ${getAttackTrajectory(effect.kind, effect.hand)}`}><i /><i /><i /><b>{effect.kind === "straight" ? "KAPOW!" : "WHAM!"}</b></div>}{hitEffect && <div className={`damage-fx ${hitEffect}`} aria-live="polite"><i /><i /><b>{hitEffect === "block" ? "BLOCK!" : "HIT!"}</b></div>}</article>
+              <article className="fighter friend"><video ref={opponentVideoRef} autoPlay playsInline />{showOpponentGloves && myHands.left && <span className="opponent-glove own-glove left" style={{ left: `${myHands.left.x * 100}%`, top: `${myHands.left.y * 100}%` }}>🥊</span>}{showOpponentGloves && myHands.right && <span className="opponent-glove own-glove right" style={{ left: `${myHands.right.x * 100}%`, top: `${myHands.right.y * 100}%` }}>🥊</span>}<span className="tag">FRIEND</span>{effect?.side === "right" && <div className={`attack-fx ${effect.kind} ${effect.hand} ${getAttackTrajectory(effect.kind, effect.hand)}`}><i /><i /><i /><b>{effect.kind === "straight" ? "KAPOW!" : "WHAM!"}</b></div>} {!connected && <div className="waiting">等待對手<br /><small>分享右側連結</small></div>}</article>
             </section>
           </section>
           {matchNotice && <section className="match-notice" aria-live="assertive"><strong>{matchNotice.title}</strong><span>{matchNotice.detail}</span></section>}
